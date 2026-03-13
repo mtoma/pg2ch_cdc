@@ -192,10 +192,11 @@ pub fn drain_cdc(cfg: &CdcConfig) -> Result<u64> {
     };
 
     let slot_rows = pg.query(&format!(
-        "SELECT confirmed_flush_lsn::text FROM pg_replication_slots WHERE slot_name = '{}'",
+        "SELECT confirmed_flush_lsn::text, restart_lsn::text FROM pg_replication_slots WHERE slot_name = '{}'",
         cfg.slot
     ))?;
     let confirmed_lsn = parse_lsn(&slot_rows[0][0])?;
+    let restart_lsn = parse_lsn(&slot_rows[0][1])?;
 
     if confirmed_lsn >= target_lsn {
         info!("Slot already at {} — nothing to process", format_lsn(confirmed_lsn));
@@ -203,12 +204,15 @@ pub fn drain_cdc(cfg: &CdcConfig) -> Result<u64> {
     }
 
     let gap_gb = (target_lsn - confirmed_lsn) as f64 / 1_073_741_824.0;
+    let replay_gb = (confirmed_lsn - restart_lsn) as f64 / 1_073_741_824.0;
 
     info!(
-        "CDC target: process WAL from {} to {} ({:.2} GB)",
+        "CDC target: process WAL from {} to {} ({:.2} GB, {:.2} GB pre-confirmed replay from {})",
         format_lsn(confirmed_lsn),
         format_lsn(target_lsn),
-        gap_gb
+        gap_gb,
+        replay_gb,
+        format_lsn(restart_lsn)
     );
     // Keep pg alive — used for pg_stat_replication progress queries during CDC
 
@@ -418,29 +422,18 @@ pub fn drain_cdc(cfg: &CdcConfig) -> Result<u64> {
             // Query pg_stat_replication for the walsender's sent_lsn — this shows
             // how far PG has decoded, even when it sends no keepalives or XLogData.
             // Join via pg_stat_activity.query which contains the slot name, since
-            // pg_stat_replication has no slot_name column.
+            // pg_stat_replication has no slot_name column (added in PG 17).
             let walsender_lsn = pg.query(&format!(
                 "SELECT r.sent_lsn::text FROM pg_stat_replication r \
                  JOIN pg_stat_activity a ON r.pid = a.pid \
-                 WHERE a.query LIKE '%SLOT \"{}\" LOGICAL%' OR a.query LIKE '%SLOT {} LOGICAL%'",
+                 WHERE a.query LIKE '%\"{}\" LOGICAL%' OR a.query LIKE '% {} %'",
                 cfg.slot, cfg.slot
             )).ok()
                 .and_then(|rows| rows.into_iter().next())
                 .and_then(|row| row.into_iter().next())
                 .and_then(|lsn_str| parse_lsn(&lsn_str).ok());
 
-            let effective_lsn = [walsender_lsn, Some(last_server_wal_end), Some(last_processed_lsn)]
-                .iter()
-                .filter_map(|x| *x)
-                .filter(|x| *x > 0)
-                .max()
-                .unwrap_or(last_processed_lsn);
-
-            let progress_pct = if target_lsn > confirmed_lsn && effective_lsn > confirmed_lsn {
-                ((effective_lsn - confirmed_lsn) as f64 / (target_lsn - confirmed_lsn) as f64 * 100.0).min(100.0)
-            } else {
-                0.0
-            };
+            let walsender_sent = walsender_lsn.unwrap_or(0);
 
             let elapsed = cdc_start.elapsed().as_secs();
             let elapsed_str = if elapsed >= 3600 {
@@ -454,25 +447,63 @@ pub fn drain_cdc(cfg: &CdcConfig) -> Result<u64> {
             // Throughput
             let msgs_per_sec = if elapsed > 0 { total_wal_msgs as f64 / elapsed as f64 } else { 0.0 };
 
-            // State: are we bottlenecked on flushing or waiting for PG?
-            let walsender_sent = walsender_lsn.unwrap_or(0);
-            let state_info = if walsender_sent > last_processed_lsn && total_wal_msgs > 0 {
-                // PG has sent more than we've processed — we're the bottleneck
-                let buffered_gb = (walsender_sent.saturating_sub(last_processed_lsn)) as f64 / 1_073_741_824.0;
-                let remaining_gb = (target_lsn.saturating_sub(walsender_sent)) as f64 / 1_073_741_824.0;
-                format!(" [flushing {:.2} GB buffered, PG at {:.2} GB remaining]",
-                    buffered_gb, remaining_gb)
-            } else if effective_lsn > last_processed_lsn {
-                // PG is decoding ahead, we're idle or caught up
-                let remaining_gb = (target_lsn.saturating_sub(effective_lsn)) as f64 / 1_073_741_824.0;
-                format!(" [PG decoding: {:.2} GB remaining]", remaining_gb)
+            // Two-phase progress:
+            // Phase 1 (replay): PG re-decodes from restart_lsn to confirmed_lsn — no data for us
+            // Phase 2 (CDC):    PG sends new WAL from confirmed_lsn to target_lsn — actual changes
+            let in_replay_phase = walsender_sent > 0 && walsender_sent < confirmed_lsn;
+            let replay_total = confirmed_lsn.saturating_sub(restart_lsn);
+
+            let (progress_str, state_info) = if in_replay_phase {
+                // Phase 1: replay
+                let replay_done = walsender_sent.saturating_sub(restart_lsn);
+                let replay_pct = if replay_total > 0 {
+                    (replay_done as f64 / replay_total as f64 * 100.0).min(100.0)
+                } else {
+                    0.0
+                };
+                let remaining_gb = confirmed_lsn.saturating_sub(walsender_sent) as f64 / 1_073_741_824.0;
+                (
+                    format!("replay {:.1}%", replay_pct),
+                    format!(" [{:.2} GB to confirmed, then {:.2} GB CDC]", remaining_gb, gap_gb),
+                )
+            } else if walsender_sent == 0 && last_server_wal_end == 0 && total_wal_msgs == 0 {
+                // No walsender visible yet
+                (
+                    "replay 0.0%".to_string(),
+                    format!(" [waiting for PG walsender ({:.2} GB replay + {:.2} GB CDC)]", replay_gb, gap_gb),
+                )
             } else {
-                String::new()
+                // Phase 2: CDC processing
+                let effective_lsn = [walsender_lsn, Some(last_server_wal_end), Some(last_processed_lsn)]
+                    .iter()
+                    .filter_map(|x| *x)
+                    .filter(|x| *x > 0)
+                    .max()
+                    .unwrap_or(last_processed_lsn);
+
+                let cdc_pct = if target_lsn > confirmed_lsn && effective_lsn > confirmed_lsn {
+                    ((effective_lsn - confirmed_lsn) as f64 / (target_lsn - confirmed_lsn) as f64 * 100.0).min(100.0)
+                } else {
+                    0.0
+                };
+
+                let state = if walsender_sent > last_processed_lsn && total_wal_msgs > 0 {
+                    let buffered_gb = walsender_sent.saturating_sub(last_processed_lsn) as f64 / 1_073_741_824.0;
+                    let remaining_gb = target_lsn.saturating_sub(walsender_sent) as f64 / 1_073_741_824.0;
+                    format!(" [flushing {:.2} GB buffered, {:.2} GB remaining]", buffered_gb, remaining_gb)
+                } else if effective_lsn > last_processed_lsn {
+                    let remaining_gb = target_lsn.saturating_sub(effective_lsn) as f64 / 1_073_741_824.0;
+                    format!(" [PG decoding: {:.2} GB remaining]", remaining_gb)
+                } else {
+                    String::new()
+                };
+
+                (format!("{:.1}%", cdc_pct), state)
             };
 
             info!(
-                "CDC [{elapsed_str}] {:.1}% — {:.1}k msgs ({:.1}k/s, {}I/{}U/{}D){}",
-                progress_pct,
+                "CDC [{elapsed_str}] {} — {:.1}k msgs ({:.1}k/s, {}I/{}U/{}D){}",
+                progress_str,
                 total_wal_msgs as f64 / 1000.0,
                 msgs_per_sec / 1000.0,
                 total_ins, total_upd, total_del,
