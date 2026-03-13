@@ -1,0 +1,23 @@
+[package]
+name = "pg2ch_cdc"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+description = "rsync-like PostgreSQL to ClickHouse CDC replicator"
+
+[dependencies]
+# PostgreSQL — safe libpq bindings (30+ years of battle-tested C code)
+libpq = "6"
+
+# ClickHouse — raw HTTP inserts (TabSeparated format, simple and reliable)
+reqwest = { version = "0.12", features = ["blocking"] }
+
+# CLI and utilities
+clap = { version = "4", features = ["derive"] }
+anyhow = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+chrono = { version = "0.4" }
+libc = "0.2"
+serde = { version = "1", features = ["derive"] }
+serde_yaml = "0.9"
