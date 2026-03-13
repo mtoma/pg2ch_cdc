@@ -2,5 +2,5 @@ target/
 mirrors/*.yaml
 *.log
 slot_analysis.py
-.claude/
 CLAUDE.md
+.claude/memory/
