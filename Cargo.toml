@@ -5,6 +5,14 @@ edition = "2021"
 license = "MIT"
 description = "rsync-like PostgreSQL to ClickHouse CDC replicator"
 
+[[bin]]
+name = "pg2ch_cdc"
+path = "src/bin/pg2ch_cdc/main.rs"
+
+[[bin]]
+name = "pg2ch_diff"
+path = "src/bin/pg2ch_diff/main.rs"
+
 [dependencies]
 # PostgreSQL — safe libpq bindings (30+ years of battle-tested C code)
 libpq = "6"
