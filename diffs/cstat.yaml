@@ -1,0 +1,23 @@
+# Diff config: cstat — COMPUSTAT tables PG ↔ CH validation
+# Same source/destination as the CDC mirror config
+
+mirror_name: cstat
+
+source:
+  host: prod-l-bdd02
+  port: 5432
+  database: db_providers
+  user: clickhouse
+  password: clickhouse
+  schema: cstat
+
+destination:
+  host: prod-l-data02
+  port: 8123
+  database: db_providers_2
+  user: default
+  password: clickhouse
+
+tables:
+  - name: sec_dprc
+    level: primary_keys

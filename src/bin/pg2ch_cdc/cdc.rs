@@ -10,10 +10,10 @@ use std::collections::HashMap;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tracing::{debug, info, warn};
 
-use crate::clickhouse::{CdcBatch, ChClient};
-use crate::pg::PgClient;
-use crate::pgoutput::{decode_pgoutput, PgoutputMessage, RelationInfo};
-use crate::types::{build_delete_row, tuple_to_strings};
+use pg2ch_cdc::clickhouse::{CdcBatch, ChClient};
+use pg2ch_cdc::pg::PgClient;
+use pg2ch_cdc::pgoutput::{decode_pgoutput, PgoutputMessage, RelationInfo};
+use pg2ch_cdc::types::{build_delete_row, tuple_to_strings};
 
 // ── Standby status feedback ─────────────────────────────────────────────
 

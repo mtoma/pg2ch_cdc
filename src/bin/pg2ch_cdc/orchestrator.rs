@@ -17,9 +17,9 @@ use std::time::{Duration, Instant};
 use tracing::{info, warn, error};
 
 use crate::cdc::{CdcConfig, drain_cdc};
-use crate::clickhouse::ChClient;
-use crate::config::MirrorConfig;
-use crate::pg::PgClient;
+use pg2ch_cdc::clickhouse::ChClient;
+use pg2ch_cdc::config::MirrorConfig;
+use pg2ch_cdc::pg::PgClient;
 
 pub fn run_mirror(config: &MirrorConfig) -> Result<()> {
     let src = &config.source;

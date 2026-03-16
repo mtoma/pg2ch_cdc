@@ -5,18 +5,13 @@
 //!   pg2ch_cdc --config mirrors/cstat.yaml
 
 mod cdc;
-mod clickhouse;
-mod config;
 mod orchestrator;
-mod pg;
-mod pgoutput;
-mod types;
 
 use anyhow::Result;
 use clap::Parser;
 use std::path::PathBuf;
 
-use config::MirrorConfig;
+use pg2ch_cdc::config::MirrorConfig;
 use orchestrator::run_mirror;
 
 #[derive(Parser)]
