@@ -61,21 +61,26 @@ fn build_column(name: &str, pg_type: &str) -> Result<PkColumn> {
         ),
 
         // Date: both sides produce YYYY-MM-DD
+        // CH: substring(toString()) is safe for all dates; formatDateTime is broken pre-1970
+        // PG: clamp to DateTime64(6) max (2299-12-31) to match CH overflow behavior
         "date" => (
-            format!("to_char({}, 'YYYY-MM-DD')", name),
-            format!("formatDateTime({}, '%Y-%m-%d')", name),
+            format!("to_char(LEAST({}, '2299-12-31'::date), 'YYYY-MM-DD')", name),
+            format!("substring(toString({}), 1, 10)", name),
         ),
 
         // Timestamp (without tz): force YYYY-MM-DD HH:MI:SS (no fractional seconds)
+        // CH: toString() gives 'YYYY-MM-DD HH:MM:SS.000000', take first 19 chars
+        // PG: clamp to DateTime64(6) max (2299-12-31 00:00:00) to match CH overflow behavior
         "timestamp" => (
-            format!("to_char({}, 'YYYY-MM-DD HH24:MI:SS')", name),
-            format!("formatDateTime({}, '%Y-%m-%d %H:%i:%S')", name),
+            format!("to_char(LEAST({}, '2299-12-31'::timestamp), 'YYYY-MM-DD HH24:MI:SS')", name),
+            format!("substring(toString({}), 1, 19)", name),
         ),
 
         // Timestamp with timezone: convert to UTC, format without tz
+        // PG: clamp to DateTime64(6) max to match CH overflow behavior
         "timestamptz" => (
-            format!("to_char({} AT TIME ZONE 'UTC', 'YYYY-MM-DD HH24:MI:SS')", name),
-            format!("formatDateTime({}, '%Y-%m-%d %H:%i:%S')", name),
+            format!("to_char(LEAST({} AT TIME ZONE 'UTC', '2299-12-31'::timestamp), 'YYYY-MM-DD HH24:MI:SS')", name),
+            format!("substring(toString({}), 1, 19)", name),
         ),
 
         // Numeric: warn — works for integer-valued numerics (common in PKs)
