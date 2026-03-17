@@ -123,7 +123,7 @@ fn process_message(
             }
         }
         PgoutputMessage::Update {
-            rel_id, new_values, ..
+            rel_id, old_values, new_values,
         } => {
             let rel = relations.get(&rel_id).with_context(|| {
                 format!("UPDATE for unknown relation id {}", rel_id)
@@ -132,6 +132,14 @@ fn process_message(
                 format!("UPDATE: no table mapping for relation id {}", rel_id)
             })?;
             if let Some(batch) = batches.get_mut(table_name) {
+                // When PK columns change, pgoutput sends old key in old_values (flag K).
+                // We must delete the old PK before inserting the new row, otherwise the
+                // old PK identity becomes a phantom row in ReplacingMergeTree.
+                if let Some(ref old_vals) = old_values {
+                    let old_row = build_delete_row(old_vals, rel);
+                    batch.add_delete(old_row);
+                    debug!("UPDATE {}: PK changed — deleting old key", table_name);
+                }
                 let row = tuple_to_strings(&new_values, rel);
                 batch.add_update(row);
                 debug!("UPDATE {}: {} values", table_name, new_values.len());
