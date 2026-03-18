@@ -98,6 +98,7 @@ pub struct CdcBatch {
     rows: Vec<Vec<String>>,
     last_flush: Instant,
     version_counter: u64,
+    rel_id: u32,
     pub total_applied: u64,
     pub total_inserts: u64,
     pub total_updates: u64,
@@ -113,16 +114,17 @@ impl CdcBatch {
         batch_size: usize,
         flush_interval: Duration,
     ) -> Self {
-        let now_ms = SystemTime::now()
+        let now_ns = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap()
-            .as_millis() as u64;
+            .as_nanos() as u64;
         Self {
             ch_table,
             columns,
             rows: Vec::new(),
             last_flush: Instant::now(),
-            version_counter: now_ms,
+            version_counter: now_ns,
+            rel_id: 0,
             total_applied: 0,
             total_inserts: 0,
             total_updates: 0,
@@ -132,6 +134,10 @@ impl CdcBatch {
         }
     }
 
+    pub fn set_rel_id(&mut self, id: u32) {
+        self.rel_id = id;
+    }
+
     pub fn add_insert(&mut self, values: Vec<String>) {
         self.version_counter += 1;
         self.total_inserts += 1;
@@ -139,6 +145,7 @@ impl CdcBatch {
             .format("%Y-%m-%d %H:%M:%S%.9f")
             .to_string();
         let mut row = values;
+        row.push(self.rel_id.to_string());
         row.push(now);
         row.push("0".into());
         row.push(self.version_counter.to_string());
@@ -152,6 +159,7 @@ impl CdcBatch {
             .format("%Y-%m-%d %H:%M:%S%.9f")
             .to_string();
         let mut row = values;
+        row.push(self.rel_id.to_string());
         row.push(now);
         row.push("0".into());
         row.push(self.version_counter.to_string());
@@ -165,6 +173,7 @@ impl CdcBatch {
             .format("%Y-%m-%d %H:%M:%S%.9f")
             .to_string();
         let mut row = values;
+        row.push(self.rel_id.to_string());
         row.push(now);
         row.push("1".into());
         row.push(self.version_counter.to_string());
@@ -193,7 +202,7 @@ impl CdcBatch {
             .columns
             .iter()
             .map(|s| s.as_str())
-            .chain(["_pg2ch_synced_at", "_pg2ch_is_deleted", "_pg2ch_version"])
+            .chain(["_pg2ch_rel_id", "_pg2ch_synced_at", "_pg2ch_is_deleted", "_pg2ch_version"])
             .collect();
 
         let col_list = all_columns.join(", ");

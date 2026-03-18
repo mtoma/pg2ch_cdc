@@ -6,9 +6,9 @@
 //! Any WAL accumulated during processing is left for the next run.
 
 use anyhow::{bail, Context, Result};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
-use tracing::{debug, info, warn};
+use tracing::{debug, error, info, warn};
 
 use pg2ch_cdc::clickhouse::{CdcBatch, ChClient};
 use pg2ch_cdc::pg::PgClient;
@@ -114,14 +114,48 @@ fn process_message(
     relations: &mut HashMap<u32, RelationInfo>,
     rel_to_table: &mut HashMap<u32, String>,
     batches: &mut HashMap<String, CdcBatch>,
+    expected_oids: &HashMap<String, u32>,
+    stale_rel_ids: &mut HashSet<u32>,
 ) -> Result<()> {
     match msg {
         PgoutputMessage::Relation(rel) => {
             if batches.contains_key(&rel.name) {
-                info!(
-                    "Relation: {}.{} (id={}, {} columns) — matched to CDC batch",
-                    rel.namespace, rel.name, rel.id, rel.columns.len()
-                );
+                let ident_char = rel.replica_identity as char;
+                let ident_desc = match rel.replica_identity {
+                    b'd' => "default (PK)",
+                    b'f' => "FULL",
+                    b'n' => "NOTHING",
+                    b'i' => "INDEX",
+                    _ => "unknown",
+                };
+                if rel.replica_identity == b'n' {
+                    error!(
+                        "REPLICA IDENTITY NOTHING on {}.{} (id={}) — PK was dropped! \
+                         DELETEs/UPDATEs will be lost. Table needs full reload after PK is restored.",
+                        rel.namespace, rel.name, rel.id
+                    );
+                }
+
+                // Check if this rel_id matches the expected OID stored in CH.
+                // If not, this is WAL from the OLD (dropped) table — mark as stale.
+                let expected = expected_oids.get(&rel.name).copied().unwrap_or(0);
+                if expected != 0 && rel.id != expected {
+                    error!(
+                        "STALE OID: {}.{} has rel_id={} but CH has _pg2ch_rel_id={}. \
+                         Table was dropped+recreated. Ignoring WAL for old OID.",
+                        rel.namespace, rel.name, rel.id, expected
+                    );
+                    stale_rel_ids.insert(rel.id);
+                } else {
+                    info!(
+                        "Relation: {}.{} (id={}, {} columns, replica_identity={} [{}]) — matched to CDC batch",
+                        rel.namespace, rel.name, rel.id, rel.columns.len(), ident_char, ident_desc
+                    );
+                    // Update the batch's rel_id from the WAL Relation message
+                    if let Some(batch) = batches.get_mut(&rel.name) {
+                        batch.set_rel_id(rel.id);
+                    }
+                }
             } else {
                 debug!(
                     "Relation: {}.{} (id={}, {} columns)",
@@ -132,6 +166,10 @@ fn process_message(
             relations.insert(rel.id, rel);
         }
         PgoutputMessage::Insert { rel_id, values } => {
+            if stale_rel_ids.contains(&rel_id) {
+                debug!("Skipping INSERT for stale rel_id {}", rel_id);
+                return Ok(());
+            }
             let rel = relations.get(&rel_id).with_context(|| {
                 format!("INSERT for unknown relation id {}", rel_id)
             })?;
@@ -149,6 +187,10 @@ fn process_message(
         PgoutputMessage::Update {
             rel_id, old_values, new_values,
         } => {
+            if stale_rel_ids.contains(&rel_id) {
+                debug!("Skipping UPDATE for stale rel_id {}", rel_id);
+                return Ok(());
+            }
             let rel = relations.get(&rel_id).with_context(|| {
                 format!("UPDATE for unknown relation id {}", rel_id)
             })?;
@@ -176,6 +218,10 @@ fn process_message(
             key_or_old,
             values,
         } => {
+            if stale_rel_ids.contains(&rel_id) {
+                debug!("Skipping DELETE for stale rel_id {}", rel_id);
+                return Ok(());
+            }
             let rel = relations.get(&rel_id).with_context(|| {
                 format!("DELETE for unknown relation id {}", rel_id)
             })?;
@@ -284,6 +330,48 @@ pub fn drain_cdc(cfg: &CdcConfig) -> Result<u64> {
     if batches.is_empty() {
         bail!("No valid CDC target tables found");
     }
+
+    // Query expected OIDs from CH — used to filter stale WAL from dropped+recreated tables.
+    // If a table has multiple distinct _pg2ch_rel_id values, data is corrupted → abort.
+    let mut expected_oids: HashMap<String, u32> = HashMap::new();
+    for (pg_table, ch_table) in &cfg.tables {
+        let (ch_db, ch_tbl) = ch_table
+            .split_once('.')
+            .unwrap_or(("default", ch_table.as_str()));
+        // Check if the column exists (backward compat for old tables)
+        let has_col = ch.query(&format!(
+            "SELECT count() FROM system.columns \
+             WHERE database='{}' AND table='{}' AND name='_pg2ch_rel_id' \
+             FORMAT TabSeparated",
+            ch_db, ch_tbl
+        ))?.trim() == "1";
+        if has_col {
+            let oids_str = ch.query(&format!(
+                "SELECT DISTINCT _pg2ch_rel_id FROM {} SETTINGS final=0 FORMAT TabSeparated",
+                ch_table
+            ))?;
+            let oids: Vec<u32> = oids_str.lines()
+                .filter(|l| !l.trim().is_empty())
+                .filter_map(|l| l.trim().parse().ok())
+                .filter(|&id| id != 0)
+                .collect();
+            if oids.len() > 1 {
+                bail!(
+                    "FATAL: {} has multiple _pg2ch_rel_id values: {:?}. \
+                     Data from different table OIDs is mixed — table must be dropped and reloaded.",
+                    ch_table, oids
+                );
+            }
+            if oids.len() == 1 {
+                expected_oids.insert(pg_table.clone(), oids[0]);
+                debug!("Expected OID for {}: {}", pg_table, oids[0]);
+            }
+        }
+        // If no column or no non-zero OID, expected_oids won't have an entry → accept all
+    }
+
+    let mut stale_rel_ids: HashSet<u32> = HashSet::new();
+
     info!("Prepared {} table batches for CDC", batches.len());
 
     // ── 3. Connect replication and start streaming ──────────────────────
@@ -372,7 +460,7 @@ pub fn drain_cdc(cfg: &CdcConfig) -> Result<u64> {
 
                     match decode_pgoutput(payload) {
                         Some(msg) => {
-                            process_message(msg, &mut relations, &mut rel_to_table, &mut batches)?;
+                            process_message(msg, &mut relations, &mut rel_to_table, &mut batches, &expected_oids, &mut stale_rel_ids)?;
                         }
                         None => {
                             if !payload.is_empty() {

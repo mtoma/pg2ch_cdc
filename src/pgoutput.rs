@@ -22,6 +22,7 @@ pub struct RelationInfo {
     pub id: u32,
     pub namespace: String,
     pub name: String,
+    pub replica_identity: u8,
     pub columns: Vec<ColumnInfo>,
 }
 
@@ -90,8 +91,8 @@ fn parse_relation(data: &[u8]) -> Option<PgoutputMessage> {
     // Relation name (null-terminated)
     let name = read_cstring(data, &mut pos)?;
 
-    // Replica identity setting (1 byte)
-    let _replica_identity = *data.get(pos)?;
+    // Replica identity setting (1 byte): d=default, n=nothing, f=full, i=index
+    let replica_identity = *data.get(pos)?;
     pos += 1;
 
     // Number of columns
@@ -118,6 +119,7 @@ fn parse_relation(data: &[u8]) -> Option<PgoutputMessage> {
         id: rel_id,
         namespace,
         name,
+        replica_identity,
         columns,
     }))
 }
