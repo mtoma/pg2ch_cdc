@@ -620,6 +620,14 @@ pub fn drain_cdc(cfg: &CdcConfig) -> Result<u64> {
             "{:<30} {:>10} {:>10} {:>10} {:>10}",
             "TOTAL", total_inserts, total_updates, total_deletes, total_applied
         );
+
+        // Log relation IDs (= PG OIDs) for tables that had WAL activity.
+        // Enables detecting DROP+RENAME by comparing OIDs across runs in historic logs.
+        for (pg_table, _) in &sorted_tables {
+            if let Some(rel) = relations.values().find(|r| &r.name == *pg_table) {
+                info!("OID {}={}", pg_table, rel.id);
+            }
+        }
     } else {
         info!(
             "No relevant changes in WAL ({:.2} GB scanned, all for other tables/schemas)",
