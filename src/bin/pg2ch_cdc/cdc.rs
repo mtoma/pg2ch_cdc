@@ -65,6 +65,23 @@ fn format_lsn(lsn: u64) -> String {
     format!("{:X}/{:X}", lsn >> 32, lsn & 0xFFFFFFFF)
 }
 
+/// Parse TRUNCATE message to extract relation IDs.
+/// Format: u32 n_relations, u8 options, then n_relations × u32 rel_id.
+fn parse_truncate_rel_ids(data: &[u8]) -> Vec<u32> {
+    let mut ids = Vec::new();
+    if data.len() < 5 { return ids; } // need at least n_relations(4) + options(1)
+    let n = u32::from_be_bytes(data[0..4].try_into().unwrap_or([0; 4]));
+    // skip options byte at data[4]
+    let mut pos = 5;
+    for _ in 0..n {
+        if pos + 4 > data.len() { break; }
+        let id = u32::from_be_bytes(data[pos..pos+4].try_into().unwrap_or([0; 4]));
+        ids.push(id);
+        pos += 4;
+    }
+    ids
+}
+
 // ── CDC configuration ───────────────────────────────────────────────────
 
 pub struct CdcConfig {
@@ -100,10 +117,17 @@ fn process_message(
 ) -> Result<()> {
     match msg {
         PgoutputMessage::Relation(rel) => {
-            debug!(
-                "Relation: {}.{} (id={}, {} columns)",
-                rel.namespace, rel.name, rel.id, rel.columns.len()
-            );
+            if batches.contains_key(&rel.name) {
+                info!(
+                    "Relation: {}.{} (id={}, {} columns) — matched to CDC batch",
+                    rel.namespace, rel.name, rel.id, rel.columns.len()
+                );
+            } else {
+                debug!(
+                    "Relation: {}.{} (id={}, {} columns)",
+                    rel.namespace, rel.name, rel.id, rel.columns.len()
+                );
+            }
             rel_to_table.insert(rel.id, rel.name.clone());
             relations.insert(rel.id, rel);
         }
@@ -353,12 +377,27 @@ pub fn drain_cdc(cfg: &CdcConfig) -> Result<u64> {
                         None => {
                             if !payload.is_empty() {
                                 let msg_type = payload[0] as char;
-                                if !matches!(msg_type, 'O' | 'Y' | 'T') {
-                                    warn!(
-                                        "Unhandled pgoutput message type '{}' ({} bytes)",
-                                        msg_type,
-                                        payload.len()
-                                    );
+                                match msg_type {
+                                    'T' => {
+                                        // TRUNCATE: parse relation IDs to log which tables
+                                        let truncated = parse_truncate_rel_ids(&payload[1..]);
+                                        let names: Vec<String> = truncated.iter()
+                                            .map(|id| rel_to_table.get(id)
+                                                .cloned()
+                                                .unwrap_or_else(|| format!("rel_id={}", id)))
+                                            .collect();
+                                        warn!(
+                                            "TRUNCATE received for {} table(s): {} — NOT HANDLED, CH data may diverge",
+                                            truncated.len(), names.join(", ")
+                                        );
+                                    }
+                                    'O' | 'Y' => {} // Origin, Type — safe to skip silently
+                                    other => {
+                                        warn!(
+                                            "Unhandled pgoutput message type '{}' (0x{:02x}, {} bytes)",
+                                            other, other as u8, payload.len()
+                                        );
+                                    }
                                 }
                             }
                         }
