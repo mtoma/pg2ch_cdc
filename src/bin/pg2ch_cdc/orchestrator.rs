@@ -11,6 +11,7 @@
 //!   - Nothing to do             → idle
 
 use anyhow::{bail, Result};
+use std::collections::HashSet;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -50,6 +51,7 @@ pub fn run_mirror(config: &MirrorConfig) -> Result<()> {
 
     // ── Publication ─────────────────────────────────────────────────────
     let pub_name = config.publication_name();
+    let mut readded_tables: HashSet<String> = HashSet::new();
     let pub_exists = pg.query(&format!(
         "SELECT 1 FROM pg_publication WHERE pubname = '{}'", pub_name
     ))?;
@@ -75,6 +77,7 @@ pub fn run_mirror(config: &MirrorConfig) -> Result<()> {
             let fqn = format!("{}.{}", src.schema, table);
             if !existing_set.contains(&fqn) {
                 missing.push(fqn);
+                readded_tables.insert(table.clone());
             }
         }
         if !missing.is_empty() {
@@ -117,15 +120,22 @@ pub fn run_mirror(config: &MirrorConfig) -> Result<()> {
     struct TableInfo {
         table: String,
         pk_cols: Vec<String>,
+        pg_oid: u32,
         pg_rows_est: i64,
         ch_table_exists: bool,
         ch_has_rows: bool,
-        needs_reload: bool, // partial load detected
+        needs_reload: bool, // partial load or table dropped+recreated
     }
 
     let mut table_infos: Vec<TableInfo> = Vec::new();
     for (table, pk_cols) in &table_pks {
         let ch_table = config.ch_table_name(table);
+
+        // Query PG OID for this table
+        let oid_rows = pg.query(&format!(
+            "SELECT '{}.{}'::regclass::oid", src.schema, table
+        ))?;
+        let pg_oid: u32 = oid_rows[0][0].parse().unwrap_or(0);
 
         let ch_exists = ch.query(&format!(
             "EXISTS TABLE {} FORMAT TabSeparated", ch_table
@@ -150,7 +160,7 @@ pub fn run_mirror(config: &MirrorConfig) -> Result<()> {
 
         // Detect partial loads: table has data, but max version is 0 (no CDC yet)
         // and CH row count is way below PG estimate
-        let needs_reload = if ch_has_rows && pg_rows > 1000 {
+        let mut needs_reload = if ch_has_rows && pg_rows > 1000 {
             let max_ver = ch.query(&format!(
                 "SELECT max(_pg2ch_version) FROM {} SETTINGS final = 0 FORMAT TabSeparated", ch_table
             ))?.trim().to_string();
@@ -169,9 +179,20 @@ pub fn run_mirror(config: &MirrorConfig) -> Result<()> {
             false
         };
 
+        // Table was dropped+recreated (re-added to publication this run)
+        // and already has data in CH → needs full reload
+        if ch_has_rows && readded_tables.contains(table) {
+            warn!(
+                "Table {} was re-added to publication (dropped+recreated externally) — scheduling reload",
+                table
+            );
+            needs_reload = true;
+        }
+
         table_infos.push(TableInfo {
             table: table.clone(),
             pk_cols: pk_cols.clone(),
+            pg_oid,
             pg_rows_est: pg_rows,
             ch_table_exists,
             ch_has_rows,
@@ -222,8 +243,28 @@ pub fn run_mirror(config: &MirrorConfig) -> Result<()> {
             create_ch_table(&ch, config, &ti.table, &ch_table, &ti.pk_cols)?;
         }
         if ti.needs_reload {
-            warn!("Truncating {} (partial load detected)", ch_table);
+            warn!("Truncating {} (reload scheduled)", ch_table);
             ch.query(&format!("TRUNCATE TABLE {}", ch_table))?;
+        }
+    }
+
+    // ── Migrate existing tables: add _pg2ch_rel_id column if missing ──
+    for ti in &table_infos {
+        if ti.ch_table_exists {
+            let ch_table = config.ch_table_name(&ti.table);
+            let (ch_db, ch_tbl) = ch_table.split_once('.').unwrap_or(("default", &ch_table));
+            let has_rel_id = ch.query(&format!(
+                "SELECT count() FROM system.columns \
+                 WHERE database='{}' AND table='{}' AND name='_pg2ch_rel_id' \
+                 FORMAT TabSeparated",
+                ch_db, ch_tbl
+            ))?.trim() == "1";
+            if !has_rel_id {
+                ch.query(&format!(
+                    "ALTER TABLE {} ADD COLUMN _pg2ch_rel_id UInt32 DEFAULT 0", ch_table
+                ))?;
+                info!("Added _pg2ch_rel_id column to {}", ch_table);
+            }
         }
     }
 
@@ -235,17 +276,17 @@ pub fn run_mirror(config: &MirrorConfig) -> Result<()> {
             tables_to_load.len(), parallel
         );
 
-        // Queue includes pg_rows_est for progress monitoring
-        let load_items: Vec<(String, String, String, String, i64)> = tables_to_load.iter()
+        // Queue includes pg_rows_est for progress monitoring and pg_oid for _pg2ch_rel_id
+        let load_items: Vec<(String, String, String, String, i64, u32)> = tables_to_load.iter()
             .map(|ti| {
                 let ch_table = config.ch_table_name(&ti.table);
                 let (ch_db, ch_tbl) = ch_table.split_once('.').unwrap_or(("default", &ch_table));
-                (ti.table.clone(), ch_table.clone(), ch_db.to_string(), ch_tbl.to_string(), ti.pg_rows_est)
+                (ti.table.clone(), ch_table.clone(), ch_db.to_string(), ch_tbl.to_string(), ti.pg_rows_est, ti.pg_oid)
             })
             .collect();
 
         let errors: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
-        let queue: Arc<Mutex<std::collections::VecDeque<(String, String, String, String, i64)>>> =
+        let queue: Arc<Mutex<std::collections::VecDeque<(String, String, String, String, i64, u32)>>> =
             Arc::new(Mutex::new(load_items.into_iter().collect()));
 
         let mut handles = Vec::new();
@@ -266,12 +307,14 @@ pub fn run_mirror(config: &MirrorConfig) -> Result<()> {
 
             handles.push(std::thread::spawn(move || {
                 let ch = ChClient::new(&dst_host, dst_port, &dst_user, &dst_password, ch_timeout);
+                let worker_pg = PgClient::connect(&src_host, src_port, &src_database, &src_user, &src_password)
+                    .expect("Worker PG connect failed");
                 loop {
                     let item = {
                         let mut q = queue.lock().unwrap();
                         q.pop_front()
                     };
-                    let (table, ch_table, ch_db, ch_tbl, pg_rows_est) = match item {
+                    let (table, ch_table, ch_db, ch_tbl, pg_rows_est, _) = match item {
                         Some(item) => item,
                         None => break,
                     };
@@ -292,11 +335,24 @@ pub fn run_mirror(config: &MirrorConfig) -> Result<()> {
                     };
                     let columns: Vec<&str> = col_response.lines().filter(|l| !l.is_empty()).collect();
 
+                    // Query OID right before the load to minimize the race window
+                    // between OID capture and postgresql() reading the table.
+                    let pg_oid: u32 = match worker_pg.query(&format!(
+                        "SELECT '{}.{}'::regclass::oid", src_schema, table
+                    )) {
+                        Ok(rows) => rows[0][0].parse().unwrap_or(0),
+                        Err(e) => {
+                            error!("[W{}] Failed to get OID for {}: {:#}", worker_id, table, e);
+                            0
+                        }
+                    };
+
                     let insert = format!(
-                        "INSERT INTO {} ({}, _pg2ch_synced_at, _pg2ch_is_deleted, _pg2ch_version) \
-                         SELECT *, now64(), 0, 0 FROM postgresql('{}:{}', '{}', '{}', '{}', '{}', '{}')",
+                        "INSERT INTO {} ({}, _pg2ch_rel_id, _pg2ch_synced_at, _pg2ch_is_deleted, _pg2ch_version) \
+                         SELECT *, {}, now64(), 0, 0 FROM postgresql('{}:{}', '{}', '{}', '{}', '{}', '{}')",
                         ch_table,
                         columns.join(", "),
+                        pg_oid,
                         src_host, src_port, src_database, table, src_user, src_password, src_schema
                     );
 
@@ -477,6 +533,7 @@ fn create_ch_table(
         bail!("DESCRIBE returned no columns for {}.{}", src.schema, table);
     }
 
+    col_defs.push("    _pg2ch_rel_id UInt32 DEFAULT 0".to_string());
     col_defs.push("    _pg2ch_synced_at DateTime64(9) DEFAULT now64()".to_string());
     col_defs.push("    _pg2ch_is_deleted UInt8 DEFAULT 0".to_string());
     col_defs.push("    _pg2ch_version UInt64 DEFAULT 0".to_string());
@@ -489,6 +546,6 @@ fn create_ch_table(
     );
 
     ch.query(&ddl)?;
-    info!("  Created {} ({} cols, PK: ({}))", ch_table, col_defs.len() - 3, pk_cols.join(", "));
+    info!("  Created {} ({} cols, PK: ({}))", ch_table, col_defs.len() - 4, pk_cols.join(", "));
     Ok(())
 }
