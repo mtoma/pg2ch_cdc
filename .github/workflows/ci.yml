@@ -49,9 +49,7 @@ jobs:
           PGPASSWORD: test
         run: |
           psql -h localhost -U test -d test_db -c "ALTER SYSTEM SET wal_level = 'logical';"
-          # Restart PG inside the container to apply wal_level change
           docker restart ${{ job.services.postgres.id }}
-          # Wait for PG to come back
           for i in $(seq 1 30); do
             pg_isready -h localhost -U test && break
             sleep 1
@@ -60,12 +58,10 @@ jobs:
       - name: Verify PostgreSQL logical replication
         env:
           PGPASSWORD: test
-        run: |
-          psql -h localhost -U test -d test_db -c "SHOW wal_level;"
+        run: psql -h localhost -U test -d test_db -c "SHOW wal_level;"
 
       - name: Verify ClickHouse
-        run: |
-          curl -s 'http://localhost:8123/?query=SELECT+version()'
+        run: curl -sf 'http://localhost:8123/?query=SELECT+version()'
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
@@ -84,15 +80,15 @@ jobs:
       - name: Build
         run: cargo build --release
 
-      - name: Run tests
+      - name: Test basic replication
         env:
           TEST_PG_HOST: localhost
-          TEST_PG_PORT: 5432
+          TEST_PG_PORT: "5432"
           TEST_PG_USER: test
           TEST_PG_PASSWORD: test
           TEST_PG_DATABASE: test_db
           TEST_CH_HOST: localhost
-          TEST_CH_PORT: 8123
+          TEST_CH_PORT: "8123"
           TEST_CH_USER: default
           TEST_CH_PASSWORD: ""
-        run: cargo test
+        run: ./tests/test_basic_replication.sh
