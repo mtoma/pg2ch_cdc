@@ -15,11 +15,10 @@ jobs:
 
       - name: Start PostgreSQL
         run: |
-          docker run -d --name postgres \
+          docker run -d --name postgres --network host \
             -e POSTGRES_USER=test \
             -e POSTGRES_PASSWORD=test \
             -e POSTGRES_DB=test_db \
-            -p 5432:5432 \
             postgres:16 \
             postgres -c wal_level=logical
           # Wait for PG to be ready
@@ -30,10 +29,9 @@ jobs:
 
       - name: Start ClickHouse
         run: |
-          docker run -d --name clickhouse \
+          docker run -d --name clickhouse --network host \
             -e CLICKHOUSE_DEFAULT_ACCESS_MANAGEMENT=1 \
             -e CLICKHOUSE_PASSWORD="" \
-            -p 8123:8123 -p 9000:9000 \
             clickhouse/clickhouse-server:latest
           # Wait for CH to be ready
           for i in $(seq 1 30); do
