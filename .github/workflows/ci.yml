@@ -51,7 +51,7 @@ jobs:
           # Set wal_level and restart PG inside the container (without docker restart,
           # which disrupts the service container network)
           psql -h localhost -U test -d test_db -c "ALTER SYSTEM SET wal_level = 'logical';"
-          docker exec ${{ job.services.postgres.id }} pg_ctl restart -D /var/lib/postgresql/data -m fast -w
+          docker exec -u postgres ${{ job.services.postgres.id }} pg_ctl restart -D /var/lib/postgresql/data -m fast -w
           for i in $(seq 1 30); do
             pg_isready -h localhost -U test && break
             sleep 1
