@@ -31,6 +31,8 @@ jobs:
       - name: Start ClickHouse
         run: |
           docker run -d --name clickhouse \
+            -e CLICKHOUSE_DEFAULT_ACCESS_MANAGEMENT=1 \
+            -e CLICKHOUSE_PASSWORD="" \
             -p 8123:8123 -p 9000:9000 \
             clickhouse/clickhouse-server:latest
           # Wait for CH to be ready
