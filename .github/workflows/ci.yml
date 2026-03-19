@@ -45,7 +45,12 @@ jobs:
         run: |
           sudo apt-get update && sudo apt-get install -y postgresql-client
           psql -h localhost -U test -d test_db -c "SHOW wal_level;" | grep logical
-          curl -sf 'http://localhost:8123/?query=SELECT+version()'
+          # CH may need a moment after initial startup
+          for i in $(seq 1 15); do
+            curl -sf 'http://localhost:8123/?query=SELECT+version()' && break
+            echo "Waiting for ClickHouse... attempt $i"
+            sleep 2
+          done
 
       - name: Install system dependencies
         run: sudo apt-get install -y libpq-dev clang
