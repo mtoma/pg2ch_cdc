@@ -5,7 +5,7 @@
 //! Groups where both count and hash match are identical. Mismatching groups
 //! are reported with details.
 
-use anyhow::{bail, Result};
+use anyhow::Result;
 use std::time::Instant;
 use tracing::{info, warn};
 
