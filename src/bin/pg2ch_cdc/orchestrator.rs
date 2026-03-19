@@ -30,6 +30,9 @@ pub fn run_mirror(config: &MirrorConfig) -> Result<()> {
     let pg = PgClient::connect(&src.host, src.port, &src.database, &src.user, &src.password)?;
     let ch = ChClient::new(&dst.host, dst.port, &dst.user, &dst.password, config.settings.ch_timeout_secs);
 
+    // ── Ensure destination database exists ───────────────────────────────
+    ch.query(&format!("CREATE DATABASE IF NOT EXISTS {}", dst.database))?;
+
     // ── Validate primary keys ───────────────────────────────────────────
     info!("Validating primary keys...");
     let mut table_pks: Vec<(String, Vec<String>)> = Vec::new();

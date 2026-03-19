@@ -548,11 +548,11 @@ pub fn drain_cdc(cfg: &CdcConfig) -> Result<u64> {
 
         // Progress logging every 10 seconds
         if last_progress.elapsed() > Duration::from_secs(10) {
-            let total_applied: u64 = batches.values().map(|b| b.total_applied).sum();
+            let _total_applied: u64 = batches.values().map(|b| b.total_applied).sum();
             let total_ins: u64 = batches.values().map(|b| b.total_inserts).sum();
             let total_upd: u64 = batches.values().map(|b| b.total_updates).sum();
             let total_del: u64 = batches.values().map(|b| b.total_deletes).sum();
-            let total_pending: usize = batches.values().map(|b| b.pending_count()).sum();
+            let _total_pending: usize = batches.values().map(|b| b.pending_count()).sum();
 
             // Query pg_stat_replication for the walsender's sent_lsn — this shows
             // how far PG has decoded, even when it sends no keepalives or XLogData.
