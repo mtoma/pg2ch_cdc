@@ -15,13 +15,23 @@ CH_DATABASE="test_repl_ch"
 
 export PGPASSWORD="$TEST_PG_PASSWORD"
 PSQL="psql -h $TEST_PG_HOST -p $TEST_PG_PORT -U $TEST_PG_USER -d $TEST_PG_DATABASE -v ON_ERROR_STOP=1"
-CH="curl -sf http://$TEST_CH_HOST:$TEST_CH_PORT"
+ch_query() {
+    local response http_code
+    response=$(curl -s -w "\n%{http_code}" "http://$TEST_CH_HOST:$TEST_CH_PORT" --data-binary "$1")
+    http_code=$(echo "$response" | tail -1)
+    response=$(echo "$response" | sed '$d')
+    if [ "$http_code" -ge 400 ]; then
+        echo "ClickHouse error ($http_code): $response" >&2
+        return 1
+    fi
+    echo "$response"
+}
 
 echo "=== Cleaning up from previous runs ==="
 $PSQL -c "DROP SCHEMA IF EXISTS $SCHEMA CASCADE;"
 $PSQL -c "DROP PUBLICATION IF EXISTS pg2ch_$MIRROR_NAME;"
 $PSQL -c "SELECT pg_drop_replication_slot('pg2ch_$MIRROR_NAME') FROM pg_replication_slots WHERE slot_name = 'pg2ch_$MIRROR_NAME';" 2>/dev/null || true
-$CH --data-binary "DROP DATABASE IF EXISTS $CH_DATABASE"
+ch_query "DROP DATABASE IF EXISTS $CH_DATABASE"
 
 echo "=== Creating PG schema and tables ==="
 $PSQL <<'SQL'
@@ -105,8 +115,8 @@ echo "=== Running pg2ch_cdc ==="
 "$BIN_DIR/pg2ch_cdc" --config "$MIRROR_CONFIG" --plain
 
 echo "=== Verifying CH data ==="
-CH_USERS=$($CH --data-binary "SELECT count() FROM $CH_DATABASE.users FINAL WHERE _pg2ch_is_deleted = 0" | tr -d '[:space:]')
-CH_ORDERS=$($CH --data-binary "SELECT count() FROM $CH_DATABASE.orders FINAL WHERE _pg2ch_is_deleted = 0" | tr -d '[:space:]')
+CH_USERS=$(ch_query "SELECT count() FROM $CH_DATABASE.users FINAL WHERE _pg2ch_is_deleted = 0" | tr -d '[:space:]')
+CH_ORDERS=$(ch_query "SELECT count() FROM $CH_DATABASE.orders FINAL WHERE _pg2ch_is_deleted = 0" | tr -d '[:space:]')
 echo "CH: $CH_USERS users, $CH_ORDERS orders"
 [ "$CH_USERS" = "5" ] || { echo "FAIL: expected 5 users in CH, got $CH_USERS"; exit 1; }
 [ "$CH_ORDERS" = "10" ] || { echo "FAIL: expected 10 orders in CH, got $CH_ORDERS"; exit 1; }
@@ -146,7 +156,7 @@ echo "$DIFF_OUTPUT" | grep -q "0 mismatches" || { echo "FAIL: diff found mismatc
 
 echo "=== Cleanup ==="
 rm -f "$MIRROR_CONFIG" "$DIFF_CONFIG"
-$CH --data-binary "DROP DATABASE IF EXISTS $CH_DATABASE"
+ch_query "DROP DATABASE IF EXISTS $CH_DATABASE"
 $PSQL -c "DROP PUBLICATION IF EXISTS pg2ch_$MIRROR_NAME;"
 $PSQL -c "SELECT pg_drop_replication_slot('pg2ch_$MIRROR_NAME') FROM pg_replication_slots WHERE slot_name = 'pg2ch_$MIRROR_NAME';" 2>/dev/null || true
 $PSQL -c "DROP SCHEMA IF EXISTS $SCHEMA CASCADE;"
