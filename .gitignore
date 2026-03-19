@@ -1,5 +1,6 @@
 target/
 mirrors/*.yaml
+diffs/*.yaml
 *.log
 slot_analysis.py
 CLAUDE.md
