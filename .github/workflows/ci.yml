@@ -48,17 +48,19 @@ jobs:
         env:
           PGPASSWORD: test
         run: |
-          # Set wal_level and restart PG inside the container (without docker restart,
-          # which disrupts the service container network)
+          # wal_level requires a restart. Since PG is PID 1 in the container,
+          # pg_ctl restart kills the container. Use docker stop/start instead
+          # of docker restart to preserve the network.
           psql -h localhost -U test -d test_db -c "ALTER SYSTEM SET wal_level = 'logical';"
-          docker exec -u postgres ${{ job.services.postgres.id }} pg_ctl restart -D /var/lib/postgresql/data -m fast -w
+          docker stop ${{ job.services.postgres.id }}
+          docker start ${{ job.services.postgres.id }}
           for i in $(seq 1 30); do
             pg_isready -h localhost -U test && break
             sleep 1
           done
           psql -h localhost -U test -d test_db -c "SHOW wal_level;" | grep logical
 
-      - name: Verify services
+      - name: Verify ClickHouse
         run: curl -sf 'http://localhost:8123/?query=SELECT+version()'
 
       - name: Install Rust toolchain
