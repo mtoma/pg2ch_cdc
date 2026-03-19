@@ -45,7 +45,7 @@ jobs:
         run: |
           sudo apt-get update && sudo apt-get install -y postgresql-client
           psql -h localhost -U test -d test_db -c "SHOW wal_level;" | grep logical
-          curl -v 'http://localhost:8123/?query=SELECT+version()'
+          curl -sf 'http://localhost:8123/?query=SELECT+version()'
 
       - name: Install system dependencies
         run: sudo apt-get install -y libpq-dev clang
@@ -78,4 +78,4 @@ jobs:
           TEST_CH_PORT: "8123"
           TEST_CH_USER: default
           TEST_CH_PASSWORD: ""
-        run: ./tests/test_basic_replication.sh
+        run: bash tests/test_basic_replication.sh
