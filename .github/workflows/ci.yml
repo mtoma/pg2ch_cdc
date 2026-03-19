@@ -1,0 +1,98 @@
+name: CI
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+    branches: [master]
+
+jobs:
+  build-and-test:
+    runs-on: ubuntu-latest
+
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: test
+          POSTGRES_PASSWORD: test
+          POSTGRES_DB: test_db
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+        ports:
+          - 5432:5432
+
+      clickhouse:
+        image: clickhouse/clickhouse-server:latest
+        ports:
+          - 8123:8123
+          - 9000:9000
+        options: >-
+          --health-cmd "clickhouse-client --query 'SELECT 1'"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libpq-dev clang postgresql-client
+
+      - name: Configure PostgreSQL for logical replication
+        env:
+          PGPASSWORD: test
+        run: |
+          psql -h localhost -U test -d test_db -c "ALTER SYSTEM SET wal_level = 'logical';"
+          # Restart PG inside the container to apply wal_level change
+          docker restart ${{ job.services.postgres.id }}
+          # Wait for PG to come back
+          for i in $(seq 1 30); do
+            pg_isready -h localhost -U test && break
+            sleep 1
+          done
+
+      - name: Verify PostgreSQL logical replication
+        env:
+          PGPASSWORD: test
+        run: |
+          psql -h localhost -U test -d test_db -c "SHOW wal_level;"
+
+      - name: Verify ClickHouse
+        run: |
+          curl -s 'http://localhost:8123/?query=SELECT+version()'
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo registry and build
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-
+
+      - name: Build
+        run: cargo build --release
+
+      - name: Run tests
+        env:
+          TEST_PG_HOST: localhost
+          TEST_PG_PORT: 5432
+          TEST_PG_USER: test
+          TEST_PG_PASSWORD: test
+          TEST_PG_DATABASE: test_db
+          TEST_CH_HOST: localhost
+          TEST_CH_PORT: 8123
+          TEST_CH_USER: default
+          TEST_CH_PASSWORD: ""
+        run: cargo test
