@@ -35,10 +35,10 @@ pub fn build_delete_row(key_values: &[TupleData], rel: &RelationInfo) -> Vec<Str
         .collect();
 
     let mut key_map = HashMap::new();
-    for (ki, &col_idx) in key_cols.iter().enumerate() {
-        if ki < key_values.len() {
+    for &col_idx in &key_cols {
+        if col_idx < key_values.len() {
             let oid = rel.columns.get(col_idx).map(|c| c.type_oid).unwrap_or(0);
-            let val = match &key_values[ki] {
+            let val = match &key_values[col_idx] {
                 TupleData::Text(s) => {
                     if oid == 1184 { timestamptz_to_utc(s) } else { s.clone() }
                 }
