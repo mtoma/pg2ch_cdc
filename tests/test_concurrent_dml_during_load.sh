@@ -139,10 +139,8 @@ PG_B=$($PSQL -t -c "SELECT count(*) FROM test_concurrent.table_b;" | tr -d ' ')
 echo "PG table_b after DML: $PG_B rows"
 [ "$PG_B" = "5" ] || { echo "FAIL: expected 5 rows in PG, got $PG_B"; exit 1; }
 
-echo "=== Step 3: Truncate table_b in CH (simulate need for reload) ==="
-ch_query "TRUNCATE TABLE $CH_DATABASE.table_b SYNC"
-CH_B_AFTER_TRUNC=$(ch_query "SELECT count() FROM $CH_DATABASE.table_b" | tr -d '[:space:]')
-echo "table_b in CH after truncate: $CH_B_AFTER_TRUNC rows"
+echo "=== Step 3: Drop table_b in CH (simulate need for reload) ==="
+ch_query "DROP TABLE $CH_DATABASE.table_b SYNC"
 
 echo "=== Step 4: Run pg2ch_cdc (reload B + CDC replay of same DML) ==="
 "$BIN_DIR/pg2ch_cdc" --config "$MIRROR_CONFIG" --plain
