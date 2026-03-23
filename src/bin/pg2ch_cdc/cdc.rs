@@ -12,7 +12,7 @@ use tracing::{debug, error, info, warn};
 
 use pg2ch_cdc::clickhouse::{CdcBatch, ChClient};
 use pg2ch_cdc::pg::PgClient;
-use pg2ch_cdc::pgoutput::{decode_pgoutput, PgoutputMessage, RelationInfo, TupleData};
+use pg2ch_cdc::pgoutput::{decode_pgoutput, PgoutputMessage, RelationInfo};
 use pg2ch_cdc::types::{build_delete_row, tuple_to_strings};
 
 // ── Standby status feedback ─────────────────────────────────────────────
@@ -147,17 +147,9 @@ fn process_message(
                     );
                     stale_rel_ids.insert(rel.id);
                 } else {
-                    let col_details: Vec<String> = rel.columns.iter().map(|c| {
-                        format!("{}(oid={},flags={}{})", c.name, c.type_oid, c.flags,
-                            if c.flags & 1 != 0 { ",KEY" } else { "" })
-                    }).collect();
                     info!(
                         "Relation: {}.{} (id={}, {} columns, replica_identity={} [{}]) — matched to CDC batch",
                         rel.namespace, rel.name, rel.id, rel.columns.len(), ident_char, ident_desc
-                    );
-                    info!(
-                        "  Columns: [{}]",
-                        col_details.join(", ")
                     );
                     // Update the batch's rel_id from the WAL Relation message
                     if let Some(batch) = batches.get_mut(&rel.name) {
@@ -237,41 +229,11 @@ fn process_message(
                 format!("DELETE: no table mapping for relation id {}", rel_id)
             })?;
             if let Some(batch) = batches.get_mut(table_name) {
-                // Log the raw K/O tuple values and column flags for DELETE debugging
-                let tuple_type = if key_or_old == b'K' { "K (key)" } else { "O (old)" };
-                let raw_vals: Vec<String> = values.iter().enumerate().map(|(i, v)| {
-                    let val_str = match v {
-                        TupleData::Text(s) => format!("'{}'", s),
-                        TupleData::Binary(b) => format!("<bin {} bytes>", b.len()),
-                        TupleData::Null => "NULL".to_string(),
-                        TupleData::Unchanged => "UNCHANGED".to_string(),
-                    };
-                    format!("[{}]={}", i, val_str)
-                }).collect();
-                let key_flags: Vec<String> = rel.columns.iter().enumerate().map(|(i, c)| {
-                    format!("{}:flags={}", c.name, c.flags)
-                }).collect();
-                info!(
-                    "DELETE {} tuple_type={}, {} values: {}, column_flags: [{}]",
-                    table_name, tuple_type, values.len(),
-                    raw_vals.join(", "),
-                    key_flags.join(", ")
-                );
-
                 let row = if key_or_old == b'K' {
                     build_delete_row(&values, rel)
                 } else {
                     tuple_to_strings(&values, rel)
                 };
-
-                let row_summary: Vec<String> = rel.columns.iter().enumerate().map(|(i, c)| {
-                    format!("{}={}", c.name, row.get(i).unwrap_or(&"?".to_string()))
-                }).collect();
-                info!(
-                    "DELETE {} resulting row: [{}]",
-                    table_name, row_summary.join(", ")
-                );
-
                 batch.add_delete(row);
                 debug!("DELETE from {}", table_name);
             } else {
