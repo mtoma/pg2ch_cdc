@@ -140,7 +140,7 @@ echo "PG table_b after DML: $PG_B rows"
 [ "$PG_B" = "5" ] || { echo "FAIL: expected 5 rows in PG, got $PG_B"; exit 1; }
 
 echo "=== Step 3: Truncate table_b in CH (simulate need for reload) ==="
-ch_query "TRUNCATE TABLE $CH_DATABASE.table_b"
+ch_query "TRUNCATE TABLE $CH_DATABASE.table_b SYNC"
 CH_B_AFTER_TRUNC=$(ch_query "SELECT count() FROM $CH_DATABASE.table_b" | tr -d '[:space:]')
 echo "table_b in CH after truncate: $CH_B_AFTER_TRUNC rows"
 
