@@ -85,3 +85,16 @@ jobs:
           TEST_CH_USER: default
           TEST_CH_PASSWORD: ""
         run: bash tests/test_basic_replication.sh
+
+      - name: Test DELETE with non-contiguous PK
+        env:
+          TEST_PG_HOST: localhost
+          TEST_PG_PORT: "5432"
+          TEST_PG_USER: test
+          TEST_PG_PASSWORD: test
+          TEST_PG_DATABASE: test_db
+          TEST_CH_HOST: localhost
+          TEST_CH_PORT: "8123"
+          TEST_CH_USER: default
+          TEST_CH_PASSWORD: ""
+        run: bash tests/test_delete_noncontiguous_pk.sh
