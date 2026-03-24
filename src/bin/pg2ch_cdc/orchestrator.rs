@@ -120,6 +120,13 @@ pub fn run_mirror(config: &MirrorConfig) -> Result<()> {
     info!("Snapshotted target LSN: {} (before initial loads)", target_lsn_str);
 
     // ── Per-table diff report + actions ─────────────────────────────────
+    #[derive(Clone, Copy, PartialEq)]
+    enum ReloadReason {
+        None,
+        IncompleteLoad,
+        ReAdded,
+    }
+
     struct TableInfo {
         table: String,
         pk_cols: Vec<String>,
@@ -127,7 +134,7 @@ pub fn run_mirror(config: &MirrorConfig) -> Result<()> {
         pg_rows_est: i64,
         ch_table_exists: bool,
         ch_has_rows: bool,
-        needs_reload: bool, // partial load or table dropped+recreated
+        reload_reason: ReloadReason,
     }
 
     let mut table_infos: Vec<TableInfo> = Vec::new();
@@ -163,7 +170,7 @@ pub fn run_mirror(config: &MirrorConfig) -> Result<()> {
 
         // Detect partial loads: table has data, but max version is 0 (no CDC yet)
         // and CH row count is way below PG estimate
-        let mut needs_reload = if ch_has_rows && pg_rows > 1000 {
+        let mut reload_reason = if ch_has_rows && pg_rows > 1000 {
             let max_ver = ch.query(&format!(
                 "SELECT max(_pg2ch_version) FROM {} SETTINGS final = 0 FORMAT TabSeparated", ch_table
             ))?.trim().to_string();
@@ -174,12 +181,16 @@ pub fn run_mirror(config: &MirrorConfig) -> Result<()> {
                 ))?.trim().to_string();
                 let ch_count: i64 = ch_count_str.parse().unwrap_or(0);
                 // If CH has less than 80% of PG estimate, it's a partial load
-                ch_count < (pg_rows as f64 * 0.8) as i64
+                if ch_count < (pg_rows as f64 * 0.8) as i64 {
+                    ReloadReason::IncompleteLoad
+                } else {
+                    ReloadReason::None
+                }
             } else {
-                false // CDC has run, row diff is legitimate
+                ReloadReason::None // CDC has run, row diff is legitimate
             }
         } else {
-            false
+            ReloadReason::None
         };
 
         // Table was dropped+recreated (re-added to publication this run)
@@ -189,7 +200,7 @@ pub fn run_mirror(config: &MirrorConfig) -> Result<()> {
                 "Table {} was re-added to publication (dropped+recreated externally) — scheduling reload",
                 table
             );
-            needs_reload = true;
+            reload_reason = ReloadReason::ReAdded;
         }
 
         table_infos.push(TableInfo {
@@ -199,7 +210,7 @@ pub fn run_mirror(config: &MirrorConfig) -> Result<()> {
             pg_rows_est: pg_rows,
             ch_table_exists,
             ch_has_rows,
-            needs_reload,
+            reload_reason,
         });
     }
 
@@ -214,8 +225,13 @@ pub fn run_mirror(config: &MirrorConfig) -> Result<()> {
     let mut tables_to_load: Vec<&TableInfo> = Vec::new();
 
     for ti in &table_infos {
-        let (action, ch_display) = if ti.needs_reload {
-            ("RELOAD (partial)", "PARTIAL".to_string())
+        let (action, ch_display) = if ti.reload_reason != ReloadReason::None {
+            let reason = match ti.reload_reason {
+                ReloadReason::IncompleteLoad => "RELOAD (incomplete load)",
+                ReloadReason::ReAdded => "RELOAD (re-added)",
+                ReloadReason::None => unreachable!(),
+            };
+            (reason, "STALE".to_string())
         } else if !ti.ch_table_exists {
             ("CREATE + LOAD", "—".to_string())
         } else if !ti.ch_has_rows && ti.pg_rows_est > 0 {
@@ -233,7 +249,7 @@ pub fn run_mirror(config: &MirrorConfig) -> Result<()> {
         };
         info!("{:<30} {:>12} {:>12}  {}", ti.table, pg_display, ch_display, action);
 
-        if ti.needs_reload || !ti.ch_table_exists || (!ti.ch_has_rows && ti.pg_rows_est > 0) {
+        if ti.reload_reason != ReloadReason::None || !ti.ch_table_exists || (!ti.ch_has_rows && ti.pg_rows_est > 0) {
             tables_to_load.push(ti);
         }
     }
@@ -245,7 +261,7 @@ pub fn run_mirror(config: &MirrorConfig) -> Result<()> {
         if !ti.ch_table_exists {
             create_ch_table(&ch, config, &ti.table, &ch_table, &ti.pk_cols)?;
         }
-        if ti.needs_reload {
+        if ti.reload_reason != ReloadReason::None {
             warn!("Truncating {} (reload scheduled)", ch_table);
             ch.query(&format!("TRUNCATE TABLE {}", ch_table))?;
         }
