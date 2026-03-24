@@ -1,0 +1,15 @@
+#!/bin/bash
+# Prevent committing config files that may contain credentials.
+# .gitignore blocks normal adds, but this catches force-adds (git add -f).
+
+BLOCKED_PATTERNS="mirrors/*.yaml diffs/*.yaml"
+
+for pattern in $BLOCKED_PATTERNS; do
+    matched=$(git diff --cached --name-only --diff-filter=ACR | grep -E "^${pattern//\*/[^/]+}$")
+    if [ -n "$matched" ]; then
+        echo "ERROR: Refusing to commit config files that may contain credentials:"
+        echo "$matched"
+        echo "These paths are in .gitignore for a reason."
+        exit 1
+    fi
+done
