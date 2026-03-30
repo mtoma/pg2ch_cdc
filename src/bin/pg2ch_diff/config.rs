@@ -14,6 +14,9 @@ pub struct DiffConfig {
     /// CH database for temporary snapshot tables (defaults to destination database)
     #[serde(default)]
     pub temp_database: Option<String>,
+    /// CH HTTP timeout in seconds (default 86400 = 24h, needed for large snapshots)
+    #[serde(default = "default_ch_timeout")]
+    pub ch_timeout_secs: u64,
     pub tables: Vec<TableDiff>,
 }
 
@@ -28,6 +31,10 @@ pub struct TableDiff {
 
 fn default_batch_size() -> usize {
     1_000
+}
+
+fn default_ch_timeout() -> u64 {
+    86400
 }
 
 #[derive(Debug, Clone, Deserialize, PartialEq, PartialOrd)]

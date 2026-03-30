@@ -7,6 +7,8 @@
 
 use anyhow::{bail, Result};
 use std::collections::BTreeMap;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use std::time::Instant;
 use tracing::{info, warn};
 
@@ -35,7 +37,7 @@ pub fn run_diff(config: &DiffConfig) -> Result<Vec<TableResult>> {
     let dst = &config.destination;
 
     let pg = PgClient::connect(&src.host, src.port, &src.database, &src.user, &src.password)?;
-    let ch = ChClient::new(&dst.host, dst.port, &dst.user, &dst.password, 3600);
+    let ch = ChClient::new(&dst.host, dst.port, &dst.user, &dst.password, config.ch_timeout_secs);
 
     let mut results: Vec<TableResult> = Vec::new();
 
@@ -236,25 +238,82 @@ fn diff_table(
     ))?.trim().to_string();
     info!("  CDC version before snapshot: {}", version_before);
 
-    // Create snapshot
+    // Create snapshot with progress monitoring
     info!("  snapshotting PG via postgresql()...");
     let t0 = Instant::now();
 
     // Drop leftover from previous run
-    ch.query(&format!("DROP TABLE IF EXISTS {}", snapshot_table))?;
+    ch.query(&format!("DROP TABLE IF EXISTS {} SYNC", snapshot_table))?;
 
+    // Create empty table with same structure as CDC table (minus _pg2ch_* columns)
+    let data_columns = ch.query(&format!(
+        "SELECT name, type FROM system.columns \
+         WHERE database = '{}' AND table = '{}' AND name NOT LIKE '_pg2ch%' \
+         ORDER BY position FORMAT TabSeparated",
+        config.destination.database, table
+    ))?.trim().to_string();
+    let col_defs: Vec<String> = data_columns.lines()
+        .filter(|l| !l.is_empty())
+        .map(|l| {
+            let parts: Vec<&str> = l.split('\t').collect();
+            format!("{} {}", parts[0], parts.get(1).unwrap_or(&"String"))
+        })
+        .collect();
     ch.query(&format!(
-        "CREATE TABLE {} ENGINE = MergeTree() ORDER BY ({}) \
-         AS SELECT * FROM {}",
-        snapshot_table, pk_order, pg_func
+        "CREATE TABLE {} ({}) ENGINE = MergeTree() ORDER BY ({})",
+        snapshot_table, col_defs.join(", "), pk_order
     ))?;
+
+    // Spawn progress monitor thread
+    let snap_table_clone = snapshot_table.clone();
+    let dst = &config.destination;
+    let monitor_ch = ChClient::new(&dst.host, dst.port, &dst.user, &dst.password, 60);
+    let pg_est_for_monitor = pg_est_count;
+    let stop_monitor = Arc::new(AtomicBool::new(false));
+    let stop_flag = stop_monitor.clone();
+    let monitor_start = Instant::now();
+
+    let monitor = std::thread::spawn(move || {
+        let mut last_count: i64 = 0;
+        while !stop_flag.load(Ordering::Relaxed) {
+            std::thread::sleep(std::time::Duration::from_secs(60));
+            if stop_flag.load(Ordering::Relaxed) { break; }
+            if let Ok(result) = monitor_ch.query(&format!(
+                "SELECT count() FROM {} FORMAT TabSeparated SETTINGS final = 0", snap_table_clone
+            )) {
+                let count: i64 = result.trim().parse().unwrap_or(0);
+                let elapsed = monitor_start.elapsed().as_secs();
+                let rate = if elapsed > 0 { count as f64 / elapsed as f64 } else { 0.0 };
+                let eta = if rate > 0.0 && pg_est_for_monitor > 0 {
+                    ((pg_est_for_monitor as f64 - count as f64) / rate) as u64
+                } else { 0 };
+                let delta = count - last_count;
+                info!(
+                    "  [snapshot] {} rows ({:.0} rows/s, +{} since last, ETA {})",
+                    format_number(count), rate, format_number(delta), format_duration(eta)
+                );
+                last_count = count;
+            }
+        }
+    });
+
+    // Run the actual INSERT
+    ch.query(&format!(
+        "INSERT INTO {} SELECT * FROM {}",
+        snapshot_table, pg_func
+    ))?;
+
+    stop_monitor.store(true, Ordering::Relaxed);
+    let _ = monitor.join();
+
     let snap_secs = t0.elapsed().as_secs();
     let snap_count = ch.query(&format!(
         "SELECT count() FROM {} FORMAT TabSeparated", snapshot_table
     ))?.trim().to_string().parse::<i64>().unwrap_or(-1);
+    let snap_rate = if snap_secs > 0 { snap_count as f64 / snap_secs as f64 } else { 0.0 };
     info!(
-        "  snapshot: {} rows ({})",
-        format_number(snap_count), format_duration(snap_secs)
+        "  snapshot: {} rows ({}, {:.0} rows/s)",
+        format_number(snap_count), format_duration(snap_secs), snap_rate
     );
 
     // Count CDC side
@@ -267,7 +326,7 @@ fn diff_table(
             "count mismatch: snapshot {} / CDC {} (diff {})",
             format_number(snap_count), format_number(cdc_count), snap_count - cdc_count
         );
-        ch.query(&format!("DROP TABLE IF EXISTS {}", snapshot_table))?;
+        ch.query(&format!("DROP TABLE IF EXISTS {} SYNC", snapshot_table))?;
         return Ok(TableResult {
             table: table.clone(),
             level: table_diff.level.clone(),
@@ -391,7 +450,7 @@ fn diff_table(
         ch_table
     ))?.trim().to_string();
 
-    ch.query(&format!("DROP TABLE IF EXISTS {}", snapshot_table))?;
+    ch.query(&format!("DROP TABLE IF EXISTS {} SYNC", snapshot_table))?;
 
     if version_before != version_after {
         return Ok(TableResult {
