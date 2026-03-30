@@ -1,19 +1,20 @@
 //! Diff engine — progressive validation levels for PG ↔ CH comparison.
 //!
-//! Level 3 (PK comparison) uses grouped hash comparison: for each distinct
-//! value of the leading PK column, compute count + hash aggregate of all PKs.
-//! Groups where both count and hash match are identical. Mismatching groups
-//! are reported with details.
+//! Levels 1-2 use lightweight count-based checks.
+//! Levels 3-4 snapshot PG into a temp CH table via postgresql(), then compare
+//! entirely in CH using FULL JOIN + sipHash64. This avoids the PG bottleneck
+//! for hash computation and gives point-in-time consistency.
 
-use anyhow::Result;
+use anyhow::{bail, Result};
+use std::collections::BTreeMap;
 use std::time::Instant;
 use tracing::{info, warn};
 
 use pg2ch_cdc::clickhouse::ChClient;
 use pg2ch_cdc::pg::PgClient;
 
+use crate::col_types::{self, Column};
 use crate::config::{DiffConfig, DiffLevel, TableDiff};
-use crate::pk_types;
 
 #[derive(Debug)]
 pub struct TableResult {
@@ -157,7 +158,7 @@ fn diff_table(
     info!("  counting CH rows (FINAL)...");
     let t0 = Instant::now();
     let ch_exact = ch.query(&format!(
-        "SELECT count() FROM {} FINAL WHERE _pg2ch_is_deleted = 0 FORMAT TabSeparated", ch_table
+        "SELECT count() FROM {} FINAL FORMAT TabSeparated", ch_table
     ))?.trim().to_string();
     let ch_count: i64 = ch_exact.parse().unwrap_or(-1);
     info!("  CH count: {} ({})", format_number(ch_count), format_duration(t0.elapsed().as_secs()));
@@ -182,236 +183,293 @@ fn diff_table(
         };
     }
 
-    // ── Level 3: Primary key hash comparison (grouped) ──────────────────
-    //
-    // Strategy: GROUP BY the leading PK column, computing per group:
-    //   - count(*)
-    //   - sum of a numeric hash derived from MD5 of the full composite PK
-    //
-    // Type-aware stringification ensures PG and CH produce identical text
-    // for each PK value. Unsupported types (floats) are rejected upfront.
+    // ── Levels 3 & 4: Snapshot + CH-vs-CH comparison ─────────────────────
+    // 1. Discover columns from PG
+    // 2. Record CDC max version
+    // 3. Snapshot PG into temp CH table via postgresql()
+    // 4. Check version didn't change (table wasn't touched during snapshot)
+    // 5. Compare snapshot vs CDC in CH (FULL JOIN + sipHash64)
+    // 6. Drill down mismatches with rounding fallback
+    // 7. Drop temp table
 
-    let pk_columns = pk_types::build_pk_columns(pg, schema, table)?;
-    let pk_cols: Vec<String> = pk_columns.iter().map(|c| c.name.clone()).collect();
-    let lead_pk = &pk_columns[0].name;
+    let (all_columns, pk_names) = col_types::build_all_columns(pg, schema, table)?;
 
-    // Log PK types
-    for col in &pk_columns {
-        info!("  PK column: {} ({})", col.name, col.pg_type);
-    }
+    let hash_columns: Vec<&Column> = match table_diff.level {
+        DiffLevel::PrimaryKeys => all_columns.iter().filter(|c| c.is_pk).collect(),
+        DiffLevel::Checksum => all_columns.iter().collect(),
+        _ => unreachable!(),
+    };
 
-    let pg_concat = pk_types::pg_concat_expr(&pk_columns);
-    let ch_concat = pk_types::ch_concat_expr(&pk_columns);
-    let pg_hash_expr = pk_types::pg_hash_agg(&pg_concat);
-    let ch_hash_expr = pk_types::ch_hash_agg(&ch_concat);
+    let type_summary = summarize_types(&hash_columns);
+    info!("  hashing {} columns: {}", hash_columns.len(), type_summary);
 
-    info!(
-        "  PK hash comparison grouped by '{}' (PK: ({}))",
-        lead_pk, pk_cols.join(", ")
+    // Build CH-side hash expressions (used on both snapshot and CDC tables)
+    let ch_hash_expr = ch_siphash_expr(&hash_columns, false);
+    let ch_hash_expr_rounded = ch_siphash_expr(&hash_columns, true);
+
+    // PK join condition
+    let pk_join = pk_names.iter()
+        .map(|pk| format!("s.{pk} = c.{pk}"))
+        .collect::<Vec<_>>().join(" AND ");
+    let pk_select_s = pk_names.iter()
+        .map(|pk| format!("s.{pk}"))
+        .collect::<Vec<_>>().join(", ");
+    let pk_tostring = pk_names.iter()
+        .map(|pk| format!("toString(s.{})", pk))
+        .collect::<Vec<_>>().join(", '|', ");
+
+    // Temp table
+    let snapshot_table = config.snapshot_table_name(table);
+    let src = &config.source;
+    let pg_func = format!(
+        "postgresql('{}:{}', '{}', '{}', '{}', '{}', '{}')",
+        src.host, src.port, src.database, table, src.user, src.password, src.schema
     );
+    let pk_order = pk_names.join(", ");
 
-    // ── PG grouped query ────────────────────────────────────────────────
-    info!("  [PG] querying grouped count + hash...");
+    let overall_start = Instant::now();
+
+    // Record max version before snapshot
+    let version_before = ch.query(&format!(
+        "SELECT max(_pg2ch_version) FROM {} SETTINGS final = 0 FORMAT TabSeparated",
+        ch_table
+    ))?.trim().to_string();
+    info!("  CDC version before snapshot: {}", version_before);
+
+    // Create snapshot
+    info!("  snapshotting PG via postgresql()...");
     let t0 = Instant::now();
-    let pg_groups = pg.query(&format!(
-        "SELECT {}, count(*)::text, {}::text FROM {}.{} GROUP BY {} ORDER BY {}",
-        pk_columns[0].pg_expr, pg_hash_expr, schema, table, lead_pk, lead_pk
+
+    // Drop leftover from previous run
+    ch.query(&format!("DROP TABLE IF EXISTS {}", snapshot_table))?;
+
+    ch.query(&format!(
+        "CREATE TABLE {} ENGINE = MergeTree() ORDER BY ({}) \
+         AS SELECT * FROM {}",
+        snapshot_table, pk_order, pg_func
     ))?;
-    let pg_elapsed = t0.elapsed().as_secs();
+    let snap_secs = t0.elapsed().as_secs();
+    let snap_count = ch.query(&format!(
+        "SELECT count() FROM {} FORMAT TabSeparated", snapshot_table
+    ))?.trim().to_string().parse::<i64>().unwrap_or(-1);
     info!(
-        "  [PG] {} groups ({}, {:.0} groups/s)",
-        format_number(pg_groups.len() as i64),
-        format_duration(pg_elapsed),
-        if pg_elapsed > 0 { pg_groups.len() as f64 / pg_elapsed as f64 } else { 0.0 }
+        "  snapshot: {} rows ({})",
+        format_number(snap_count), format_duration(snap_secs)
     );
 
-    // ── CH grouped query ────────────────────────────────────────────────
-    info!("  [CH] querying grouped count + hash...");
-    let t0 = Instant::now();
-    let ch_response = ch.query(&format!(
-        "SELECT {}, toString(count()), toString({}) \
-         FROM {} FINAL WHERE _pg2ch_is_deleted = 0 \
-         GROUP BY {} ORDER BY {} FORMAT TabSeparated",
-        pk_columns[0].ch_expr, ch_hash_expr, ch_table, lead_pk, lead_pk
-    ))?;
-    let ch_elapsed = t0.elapsed().as_secs();
-    let ch_groups: Vec<Vec<&str>> = ch_response
-        .lines()
-        .filter(|l| !l.is_empty())
-        .map(|l| l.split('\t').collect())
-        .collect();
-    info!(
-        "  [CH] {} groups ({}, {:.0} groups/s)",
-        format_number(ch_groups.len() as i64),
-        format_duration(ch_elapsed),
-        if ch_elapsed > 0 { ch_groups.len() as f64 / ch_elapsed as f64 } else { 0.0 }
-    );
+    // Count CDC side
+    let cdc_count = ch.query(&format!(
+        "SELECT count() FROM {} FINAL FORMAT TabSeparated", ch_table
+    ))?.trim().to_string().parse::<i64>().unwrap_or(-1);
 
-    // ── Build maps and compare ──────────────────────────────────────────
-    // Key → (count, hash_sum)
-    let mut pg_map: std::collections::BTreeMap<&str, (i64, &str)> = std::collections::BTreeMap::new();
-    for row in &pg_groups {
-        let count: i64 = row[1].parse().unwrap_or(0);
-        pg_map.insert(&row[0], (count, &row[2]));
-    }
-    let mut ch_map: std::collections::BTreeMap<&str, (i64, &str)> = std::collections::BTreeMap::new();
-    for row in &ch_groups {
-        if row.len() >= 3 {
-            let count: i64 = row[1].parse().unwrap_or(0);
-            ch_map.insert(row[0], (count, row[2]));
-        }
-    }
-
-    let all_keys: std::collections::BTreeSet<&str> = pg_map.keys().chain(ch_map.keys()).copied().collect();
-    let total_groups = all_keys.len();
-
-    info!("  comparing {} groups...", total_groups);
-    let start = Instant::now();
-
-    let mut matched_groups: i64 = 0;
-    let mut matched_rows: i64 = 0;
-    let mut pg_only_groups: Vec<(String, i64)> = Vec::new();
-    let mut ch_only_groups: Vec<(String, i64)> = Vec::new();
-    let mut count_mismatches: Vec<(String, i64, i64)> = Vec::new();
-    let mut hash_mismatches: Vec<(String, i64, String, String)> = Vec::new(); // key, count, pg_hash, ch_hash
-    let mut groups_processed: usize = 0;
-    let mut last_progress = Instant::now();
-
-    for key in &all_keys {
-        let pg_entry = pg_map.get(key);
-        let ch_entry = ch_map.get(key);
-
-        match (pg_entry, ch_entry) {
-            (Some((pg_c, _)), None) => {
-                pg_only_groups.push((key.to_string(), *pg_c));
-            }
-            (None, Some((ch_c, _))) => {
-                ch_only_groups.push((key.to_string(), *ch_c));
-            }
-            (Some((pg_c, pg_h)), Some((ch_c, ch_h))) => {
-                if pg_c != ch_c {
-                    count_mismatches.push((key.to_string(), *pg_c, *ch_c));
-                } else if pg_h != ch_h {
-                    hash_mismatches.push((key.to_string(), *pg_c, pg_h.to_string(), ch_h.to_string()));
-                } else {
-                    matched_groups += 1;
-                    matched_rows += pg_c;
-                }
-            }
-            (None, None) => unreachable!(),
-        }
-
-        groups_processed += 1;
-
-        if last_progress.elapsed().as_secs() >= 10 {
-            let pct = groups_processed as f64 / total_groups as f64 * 100.0;
-            let elapsed = start.elapsed().as_secs();
-            let eta = if pct > 0.0 {
-                ((elapsed as f64 / pct * 100.0) - elapsed as f64) as u64
-            } else {
-                0
-            };
-            info!(
-                "  progress: {:.1}% ({}/{} groups, ETA {})",
-                pct, groups_processed, total_groups, format_duration(eta)
-            );
-            last_progress = Instant::now();
-        }
-    }
-
-    let total_elapsed = start.elapsed().as_secs();
-    let total_mismatched = pg_only_groups.len() + ch_only_groups.len() + count_mismatches.len() + hash_mismatches.len();
-
-    info!(
-        "  comparison done: {} groups ok ({} rows), {} mismatched ({})",
-        matched_groups, format_number(matched_rows),
-        total_mismatched, format_duration(total_elapsed)
-    );
-
-    if total_mismatched == 0 {
+    if snap_count != cdc_count {
+        let detail = format!(
+            "count mismatch: snapshot {} / CDC {} (diff {})",
+            format_number(snap_count), format_number(cdc_count), snap_count - cdc_count
+        );
+        ch.query(&format!("DROP TABLE IF EXISTS {}", snapshot_table))?;
         return Ok(TableResult {
             table: table.clone(),
-            level: DiffLevel::PrimaryKeys,
-            status: DiffStatus::Match {
+            level: table_diff.level.clone(),
+            status: DiffStatus::Mismatch { detail },
+        });
+    }
+    info!("  counts match: {} rows", format_number(snap_count));
+
+    // ── CH-vs-CH comparison ──────────────────────────────────────────────
+    info!("  comparing hashes...");
+    let t0 = Instant::now();
+    let compare_result = ch.query(&format!(
+        "SELECT \
+           countIf(s.h IS NOT NULL AND c.h IS NULL) as missing_in_cdc, \
+           countIf(s.h IS NULL AND c.h IS NOT NULL) as missing_in_snapshot, \
+           countIf(s.h != c.h) as hash_mismatch, \
+           countIf(s.h = c.h) as matching \
+         FROM (\
+           SELECT {pk_select}, {hash} as h FROM {snap}\
+         ) s \
+         FULL JOIN (\
+           SELECT {pk_select_bare}, {hash} as h FROM {cdc} FINAL\
+         ) c ON {join} \
+         FORMAT TabSeparated",
+        pk_select = pk_names.iter().map(|pk| format!("{}", pk)).collect::<Vec<_>>().join(", "),
+        pk_select_bare = pk_names.iter().map(|pk| format!("{}", pk)).collect::<Vec<_>>().join(", "),
+        hash = ch_hash_expr,
+        snap = snapshot_table,
+        cdc = ch_table,
+        join = pk_join,
+    ))?.trim().to_string();
+    let compare_secs = t0.elapsed().as_secs();
+
+    let parts: Vec<&str> = compare_result.split('\t').collect();
+    let missing_in_cdc: i64 = parts.get(0).and_then(|s| s.parse().ok()).unwrap_or(0);
+    let missing_in_snapshot: i64 = parts.get(1).and_then(|s| s.parse().ok()).unwrap_or(0);
+    let hash_mismatch: i64 = parts.get(2).and_then(|s| s.parse().ok()).unwrap_or(0);
+    let matching: i64 = parts.get(3).and_then(|s| s.parse().ok()).unwrap_or(0);
+
+    info!(
+        "  comparison done ({}): {} matching, {} mismatches, {} missing in CDC, {} missing in snapshot",
+        format_duration(compare_secs), format_number(matching),
+        format_number(hash_mismatch), format_number(missing_in_cdc), format_number(missing_in_snapshot)
+    );
+
+    let total_issues = missing_in_cdc + missing_in_snapshot + hash_mismatch;
+
+    // Drill down hash mismatches with rounding fallback
+    let (ulp_noise, real_mismatch) = if hash_mismatch > 0 {
+        info!("  re-checking {} hash mismatches with rounding fallback...", hash_mismatch);
+        let t0 = Instant::now();
+
+        let drilldown_result = ch.query(&format!(
+            "SELECT \
+               countIf(s.hr = c.hr) as ulp_noise, \
+               countIf(s.hr != c.hr) as real_mismatch \
+             FROM (\
+               SELECT {pk_select}, {hash} as h, {hash_r} as hr FROM {snap}\
+             ) s \
+             JOIN (\
+               SELECT {pk_select_bare}, {hash} as h, {hash_r} as hr FROM {cdc} FINAL\
+             ) c ON {join} \
+             WHERE s.h != c.h \
+             FORMAT TabSeparated",
+            pk_select = pk_names.join(", "),
+            pk_select_bare = pk_names.join(", "),
+            hash = ch_hash_expr,
+            hash_r = ch_hash_expr_rounded,
+            snap = snapshot_table,
+            cdc = ch_table,
+            join = pk_join,
+        ))?.trim().to_string();
+
+        let parts: Vec<&str> = drilldown_result.split('\t').collect();
+        let ulp_noise: i64 = parts.get(0).and_then(|s| s.parse().ok()).unwrap_or(0);
+        let real_mismatch: i64 = parts.get(1).and_then(|s| s.parse().ok()).unwrap_or(0);
+
+        info!(
+            "  rounding fallback ({}): {} ULP noise, {} real mismatches",
+            format_duration(t0.elapsed().as_secs()), ulp_noise, real_mismatch
+        );
+
+        // Show sample real mismatches
+        if real_mismatch > 0 {
+            let samples = ch.query(&format!(
+                "SELECT concat({pk_str}) as pk \
+                 FROM (\
+                   SELECT {pk_select}, {hash} as h, {hash_r} as hr FROM {snap}\
+                 ) s \
+                 JOIN (\
+                   SELECT {pk_select_bare}, {hash} as h, {hash_r} as hr FROM {cdc} FINAL\
+                 ) c ON {join} \
+                 WHERE s.h != c.h AND s.hr != c.hr \
+                 LIMIT 20 \
+                 FORMAT TabSeparated",
+                pk_str = pk_tostring,
+                pk_select = pk_names.join(", "),
+                pk_select_bare = pk_names.join(", "),
+                hash = ch_hash_expr,
+                hash_r = ch_hash_expr_rounded,
+                snap = snapshot_table,
+                cdc = ch_table,
+                join = pk_join,
+            ))?.trim().to_string();
+
+            for line in samples.lines().filter(|l| !l.is_empty()) {
+                info!("    PK({}) value mismatch", line);
+            }
+        }
+
+        (ulp_noise, real_mismatch)
+    } else {
+        (0, 0)
+    };
+
+    // ── Version stability check (AFTER all comparison queries) ───────────
+    // The CDC table must not have been modified during the entire process
+    // (snapshot + comparison), otherwise results are meaningless.
+    let version_after = ch.query(&format!(
+        "SELECT max(_pg2ch_version) FROM {} SETTINGS final = 0 FORMAT TabSeparated",
+        ch_table
+    ))?.trim().to_string();
+
+    ch.query(&format!("DROP TABLE IF EXISTS {}", snapshot_table))?;
+
+    if version_before != version_after {
+        return Ok(TableResult {
+            table: table.clone(),
+            level: table_diff.level.clone(),
+            status: DiffStatus::Error {
                 detail: format!(
-                    "all {} groups match ({} rows, {} distinct {})",
-                    matched_groups, format_number(matched_rows), total_groups, lead_pk
+                    "CDC version changed during comparison ({} → {}) — results invalid, retry later",
+                    version_before, version_after
                 ),
             },
         });
     }
+    info!("  CDC version stable (no changes during snapshot + comparison)");
 
-    // ── Report mismatches ───────────────────────────────────────────────
-    let max_show = 20;
+    // ── Build result ─────────────────────────────────────────────────────
+    let effective_mismatches = real_mismatch + missing_in_cdc + missing_in_snapshot;
 
-    if !pg_only_groups.is_empty() {
-        let total_rows: i64 = pg_only_groups.iter().map(|(_, c)| c).sum();
-        info!(
-            "  {} in PG only: {} groups, {} rows",
-            lead_pk, pg_only_groups.len(), format_number(total_rows)
-        );
-        for (key, count) in pg_only_groups.iter().take(max_show) {
-            info!("    {}={} ({} rows)", lead_pk, key, count);
-        }
-        if pg_only_groups.len() > max_show {
-            info!("    ... and {} more", pg_only_groups.len() - max_show);
-        }
+    if total_issues == 0 || effective_mismatches == 0 {
+        Ok(TableResult {
+            table: table.clone(),
+            level: table_diff.level.clone(),
+            status: DiffStatus::Match {
+                detail: if ulp_noise > 0 {
+                    format!(
+                        "all {} rows match ({} ULP noise resolved, {})",
+                        format_number(matching + ulp_noise),
+                        ulp_noise,
+                        format_duration(overall_start.elapsed().as_secs())
+                    )
+                } else {
+                    format!(
+                        "all {} rows match ({})",
+                        format_number(matching),
+                        format_duration(overall_start.elapsed().as_secs())
+                    )
+                },
+            },
+        })
+    } else {
+        Ok(TableResult {
+            table: table.clone(),
+            level: table_diff.level.clone(),
+            status: DiffStatus::Mismatch {
+                detail: format!(
+                    "{} real mismatches, {} missing in CDC, {} missing in snapshot, {} ULP noise ({} rows matched, {})",
+                    real_mismatch, missing_in_cdc, missing_in_snapshot, ulp_noise,
+                    format_number(matching),
+                    format_duration(overall_start.elapsed().as_secs())
+                ),
+            },
+        })
     }
+}
 
-    if !ch_only_groups.is_empty() {
-        let total_rows: i64 = ch_only_groups.iter().map(|(_, c)| c).sum();
-        info!(
-            "  {} in CH only: {} groups, {} rows",
-            lead_pk, ch_only_groups.len(), format_number(total_rows)
-        );
-        for (key, count) in ch_only_groups.iter().take(max_show) {
-            info!("    {}={} ({} rows)", lead_pk, key, count);
+/// Build a sipHash64 expression for CH using either bit-masked or rounded float expressions.
+/// Uses arrayStringConcat to keep AST depth flat regardless of column count.
+fn ch_siphash_expr(columns: &[&Column], use_rounded: bool) -> String {
+    let parts: Vec<String> = columns.iter().map(|c| {
+        if use_rounded {
+            c.ch_expr_rounded.clone()
+        } else {
+            c.ch_expr.clone()
         }
-        if ch_only_groups.len() > max_show {
-            info!("    ... and {} more", ch_only_groups.len() - max_show);
-        }
+    }).collect();
+
+    let array_elems = parts.join(", ");
+    format!("sipHash64(arrayStringConcat([{}], '|'))", array_elems)
+}
+
+fn summarize_types(columns: &[&Column]) -> String {
+    let mut type_counts: BTreeMap<&str, usize> = BTreeMap::new();
+    for col in columns {
+        *type_counts.entry(&col.pg_type).or_insert(0) += 1;
     }
-
-    if !count_mismatches.is_empty() {
-        info!("  count mismatches: {} groups", count_mismatches.len());
-        for (key, pg_c, ch_c) in count_mismatches.iter().take(max_show) {
-            info!("    {}={}: PG {} / CH {} (diff {})", lead_pk, key, pg_c, ch_c, pg_c - ch_c);
-        }
-        if count_mismatches.len() > max_show {
-            info!("    ... and {} more", count_mismatches.len() - max_show);
-        }
-    }
-
-    if !hash_mismatches.is_empty() {
-        info!(
-            "  hash mismatches (same count, different PKs): {} groups",
-            hash_mismatches.len()
-        );
-        for (key, count, pg_h, ch_h) in hash_mismatches.iter().take(max_show) {
-            info!(
-                "    {}={}: {} rows, PG hash {} / CH hash {}",
-                lead_pk, key, count, pg_h, ch_h
-            );
-        }
-        if hash_mismatches.len() > max_show {
-            info!("    ... and {} more", hash_mismatches.len() - max_show);
-        }
-    }
-
-    let pg_only_rows: i64 = pg_only_groups.iter().map(|(_, c)| c).sum();
-    let ch_only_rows: i64 = ch_only_groups.iter().map(|(_, c)| c).sum();
-
-    Ok(TableResult {
-        table: table.clone(),
-        level: DiffLevel::PrimaryKeys,
-        status: DiffStatus::Mismatch {
-            detail: format!(
-                "{} of {} groups differ: {} PG-only ({} rows), {} CH-only ({} rows), {} count mismatches, {} hash mismatches",
-                total_mismatched, total_groups,
-                pg_only_groups.len(), format_number(pg_only_rows),
-                ch_only_groups.len(), format_number(ch_only_rows),
-                count_mismatches.len(), hash_mismatches.len()
-            ),
-        },
-    })
+    let parts: Vec<String> = type_counts
+        .iter()
+        .map(|(t, c)| format!("{} {}", c, t))
+        .collect();
+    parts.join(", ")
 }

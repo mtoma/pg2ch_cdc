@@ -4,9 +4,9 @@
 //!
 //!   pg2ch_diff --config diffs/cstat.yaml
 
+mod col_types;
 mod config;
 mod diff;
-mod pk_types;
 
 use anyhow::Result;
 use clap::Parser;

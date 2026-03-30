@@ -11,6 +11,9 @@ pub struct DiffConfig {
     pub mirror_name: String,
     pub source: pg2ch_cdc::config::SourceConfig,
     pub destination: pg2ch_cdc::config::DestinationConfig,
+    /// CH database for temporary snapshot tables (defaults to destination database)
+    #[serde(default)]
+    pub temp_database: Option<String>,
     pub tables: Vec<TableDiff>,
 }
 
@@ -19,6 +22,12 @@ pub struct TableDiff {
     pub name: String,
     #[serde(default = "default_level")]
     pub level: DiffLevel,
+    #[serde(default = "default_batch_size")]
+    pub batch_size: usize,
+}
+
+fn default_batch_size() -> usize {
+    1_000
 }
 
 #[derive(Debug, Clone, Deserialize, PartialEq, PartialOrd)]
@@ -30,6 +39,8 @@ pub enum DiffLevel {
     ExactCount,
     /// Level 3: sorted PK set comparison
     PrimaryKeys,
+    /// Level 4: full row checksum comparison (all columns, batched)
+    Checksum,
 }
 
 fn default_level() -> DiffLevel {
@@ -50,5 +61,10 @@ impl DiffConfig {
 
     pub fn ch_table_name(&self, table: &str) -> String {
         format!("{}.{}", self.destination.database, table)
+    }
+
+    pub fn snapshot_table_name(&self, table: &str) -> String {
+        let db = self.temp_database.as_deref().unwrap_or(&self.destination.database);
+        format!("{}._diff_{}", db, table)
     }
 }
