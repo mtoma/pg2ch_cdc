@@ -365,112 +365,201 @@ fn diff_table(
     }
     info!("  counts match: {} rows", format_number(snap_count));
 
-    // ── CH-vs-CH comparison ──────────────────────────────────────────────
-    info!("  comparing hashes...");
-    let t0 = Instant::now();
-    let compare_result = ch.query(&format!(
-        "SELECT \
-           countIf(s.h IS NOT NULL AND c.h IS NULL) as missing_in_cdc, \
-           countIf(s.h IS NULL AND c.h IS NOT NULL) as missing_in_snapshot, \
-           countIf(s.h != c.h) as hash_mismatch, \
-           countIf(s.h = c.h) as matching \
-         FROM (\
-           SELECT {pk_select}, {hash} as h FROM {snap}\
-         ) s \
-         FULL JOIN (\
-           SELECT {pk_select_bare}, {hash} as h FROM {cdc} FINAL\
-         ) c ON {join} \
-         FORMAT TabSeparated",
-        pk_select = pk_names.iter().map(|pk| format!("{}", pk)).collect::<Vec<_>>().join(", "),
-        pk_select_bare = pk_names.iter().map(|pk| format!("{}", pk)).collect::<Vec<_>>().join(", "),
-        hash = ch_hash_expr,
-        snap = snapshot_table,
-        cdc = ch_table,
-        join = pk_join,
-    ))?.trim().to_string();
-    let compare_secs = t0.elapsed().as_secs();
+    // ── CH-vs-CH chunked comparison ─────────────────────────────────────
+    // Split by leading PK range to keep memory bounded for large tables.
+    // Get min/max of leading PK from the snapshot table.
+    let lead_pk = &pk_names[0];
+    let pk_select_list = pk_names.join(", ");
 
-    let parts: Vec<&str> = compare_result.split('\t').collect();
-    let missing_in_cdc: i64 = parts.get(0).and_then(|s| s.parse().ok()).unwrap_or(0);
-    let missing_in_snapshot: i64 = parts.get(1).and_then(|s| s.parse().ok()).unwrap_or(0);
-    let hash_mismatch: i64 = parts.get(2).and_then(|s| s.parse().ok()).unwrap_or(0);
-    let matching: i64 = parts.get(3).and_then(|s| s.parse().ok()).unwrap_or(0);
+    let range_result = ch.query(&format!(
+        "SELECT min({pk}), max({pk}) FROM {snap} FORMAT TabSeparated",
+        pk = lead_pk, snap = snapshot_table,
+    ))?.trim().to_string();
+    let range_parts: Vec<&str> = range_result.split('\t').collect();
+    let pk_min = range_parts.get(0).unwrap_or(&"").to_string();
+    let pk_max = range_parts.get(1).unwrap_or(&"").to_string();
+
+    // Determine chunk count: target ~20M rows per chunk (tested safe for FULL JOIN)
+    let target_chunk_rows: i64 = 20_000_000;
+    let num_chunks = ((snap_count / target_chunk_rows) + 1).max(1) as usize;
+
+    // Build chunk boundaries by sampling the snapshot's leading PK
+    let boundaries: Vec<String> = if num_chunks <= 1 {
+        vec![] // single chunk, no boundaries needed
+    } else {
+        let boundary_result = ch.query(&format!(
+            "SELECT {pk} FROM (\
+               SELECT {pk}, rowNumberInAllBlocks() as rn \
+               FROM {snap} ORDER BY {pk}\
+             ) WHERE rn % {chunk_size} = 0 AND rn > 0 \
+             FORMAT TabSeparated",
+            pk = lead_pk, snap = snapshot_table,
+            chunk_size = snap_count / num_chunks as i64,
+        ))?.trim().to_string();
+        boundary_result.lines()
+            .filter(|l| !l.is_empty())
+            .map(|l| l.to_string())
+            .collect()
+    };
 
     info!(
-        "  comparison done ({}): {} matching, {} mismatches, {} missing in CDC, {} missing in snapshot",
-        format_duration(compare_secs), format_number(matching),
-        format_number(hash_mismatch), format_number(missing_in_cdc), format_number(missing_in_snapshot)
+        "  comparing hashes in {} chunk(s) (leading PK {} .. {})",
+        boundaries.len() + 1, pk_min, pk_max
     );
 
-    let total_issues = missing_in_cdc + missing_in_snapshot + hash_mismatch;
+    let compare_start = Instant::now();
+    let mut total_matching: i64 = 0;
+    let mut total_missing_cdc: i64 = 0;
+    let mut total_missing_snap: i64 = 0;
+    let mut total_hash_mismatch: i64 = 0;
+    let mut total_ulp_noise: i64 = 0;
+    let mut total_real_mismatch: i64 = 0;
+    let mut shown_mismatches: usize = 0;
+    let max_show = 20usize;
 
-    // Drill down hash mismatches with rounding fallback
-    let (ulp_noise, real_mismatch) = if hash_mismatch > 0 {
-        info!("  re-checking {} hash mismatches with rounding fallback...", hash_mismatch);
+    // Build list of (lower_bound, upper_bound) — None means unbounded
+    let mut ranges: Vec<(Option<&str>, Option<&str>)> = Vec::new();
+    let mut prev: Option<&str> = None;
+    for b in &boundaries {
+        ranges.push((prev, Some(b.as_str())));
+        prev = Some(b.as_str());
+    }
+    ranges.push((prev, None)); // last chunk: from last boundary to end
+
+    for (chunk_idx, (lower, upper)) in ranges.iter().enumerate() {
+        // Build WHERE clause for this chunk on the leading PK
+        let where_clause = match (lower, upper) {
+            (None, None) => String::new(),
+            (Some(lo), None) => format!("WHERE {} >= '{}'", lead_pk, lo),
+            (None, Some(hi)) => format!("WHERE {} < '{}'", lead_pk, hi),
+            (Some(lo), Some(hi)) => format!("WHERE {} >= '{}' AND {} < '{}'", lead_pk, lo, lead_pk, hi),
+        };
+
         let t0 = Instant::now();
-
-        let drilldown_result = ch.query(&format!(
+        let compare_result = ch.query(&format!(
             "SELECT \
-               countIf(s.hr = c.hr) as ulp_noise, \
-               countIf(s.hr != c.hr) as real_mismatch \
+               countIf(s.h IS NOT NULL AND c.h IS NULL), \
+               countIf(s.h IS NULL AND c.h IS NOT NULL), \
+               countIf(s.h != c.h), \
+               countIf(s.h = c.h) \
              FROM (\
-               SELECT {pk_select}, {hash} as h, {hash_r} as hr FROM {snap}\
+               SELECT {pk_select}, {hash} as h FROM {snap} {where}\
              ) s \
-             JOIN (\
-               SELECT {pk_select_bare}, {hash} as h, {hash_r} as hr FROM {cdc} FINAL\
+             FULL JOIN (\
+               SELECT {pk_select}, {hash} as h FROM {cdc} FINAL {where}\
              ) c ON {join} \
-             WHERE s.h != c.h \
              FORMAT TabSeparated",
-            pk_select = pk_names.join(", "),
-            pk_select_bare = pk_names.join(", "),
+            pk_select = pk_select_list,
             hash = ch_hash_expr,
-            hash_r = ch_hash_expr_rounded,
             snap = snapshot_table,
             cdc = ch_table,
+            where = where_clause,
             join = pk_join,
         ))?.trim().to_string();
+        let chunk_secs = t0.elapsed().as_secs();
 
-        let parts: Vec<&str> = drilldown_result.split('\t').collect();
-        let ulp_noise: i64 = parts.get(0).and_then(|s| s.parse().ok()).unwrap_or(0);
-        let real_mismatch: i64 = parts.get(1).and_then(|s| s.parse().ok()).unwrap_or(0);
+        let parts: Vec<&str> = compare_result.split('\t').collect();
+        let miss_cdc: i64 = parts.get(0).and_then(|s| s.parse().ok()).unwrap_or(0);
+        let miss_snap: i64 = parts.get(1).and_then(|s| s.parse().ok()).unwrap_or(0);
+        let h_mismatch: i64 = parts.get(2).and_then(|s| s.parse().ok()).unwrap_or(0);
+        let h_match: i64 = parts.get(3).and_then(|s| s.parse().ok()).unwrap_or(0);
 
-        info!(
-            "  rounding fallback ({}): {} ULP noise, {} real mismatches",
-            format_duration(t0.elapsed().as_secs()), ulp_noise, real_mismatch
-        );
+        total_matching += h_match;
+        total_missing_cdc += miss_cdc;
+        total_missing_snap += miss_snap;
+        total_hash_mismatch += h_mismatch;
 
-        // Show sample real mismatches
-        if real_mismatch > 0 {
-            let samples = ch.query(&format!(
-                "SELECT concat({pk_str}) as pk \
+        // Drill down hash mismatches in this chunk with rounding fallback
+        let mut chunk_ulp: i64 = 0;
+        let mut chunk_real: i64 = 0;
+        if h_mismatch > 0 {
+            let drill_result = ch.query(&format!(
+                "SELECT \
+                   countIf(s.hr = c.hr), countIf(s.hr != c.hr) \
                  FROM (\
-                   SELECT {pk_select}, {hash} as h, {hash_r} as hr FROM {snap}\
+                   SELECT {pk_select}, {hash} as h, {hash_r} as hr FROM {snap} {where}\
                  ) s \
                  JOIN (\
-                   SELECT {pk_select_bare}, {hash} as h, {hash_r} as hr FROM {cdc} FINAL\
+                   SELECT {pk_select}, {hash} as h, {hash_r} as hr FROM {cdc} FINAL {where}\
                  ) c ON {join} \
-                 WHERE s.h != c.h AND s.hr != c.hr \
-                 LIMIT 20 \
+                 WHERE s.h != c.h \
                  FORMAT TabSeparated",
-                pk_str = pk_tostring,
-                pk_select = pk_names.join(", "),
-                pk_select_bare = pk_names.join(", "),
+                pk_select = pk_select_list,
                 hash = ch_hash_expr,
                 hash_r = ch_hash_expr_rounded,
                 snap = snapshot_table,
                 cdc = ch_table,
+                where = where_clause,
                 join = pk_join,
             ))?.trim().to_string();
+            let dp: Vec<&str> = drill_result.split('\t').collect();
+            chunk_ulp = dp.get(0).and_then(|s| s.parse().ok()).unwrap_or(0);
+            chunk_real = dp.get(1).and_then(|s| s.parse().ok()).unwrap_or(0);
+            total_ulp_noise += chunk_ulp;
+            total_real_mismatch += chunk_real;
 
-            for line in samples.lines().filter(|l| !l.is_empty()) {
-                info!("    PK({}) value mismatch", line);
+            // Show sample mismatches
+            if chunk_real > 0 && shown_mismatches < max_show {
+                let samples = ch.query(&format!(
+                    "SELECT concat({pk_str}) \
+                     FROM (\
+                       SELECT {pk_select}, {hash} as h, {hash_r} as hr FROM {snap} {where}\
+                     ) s \
+                     JOIN (\
+                       SELECT {pk_select}, {hash} as h, {hash_r} as hr FROM {cdc} FINAL {where}\
+                     ) c ON {join} \
+                     WHERE s.h != c.h AND s.hr != c.hr \
+                     LIMIT {lim} \
+                     FORMAT TabSeparated",
+                    pk_str = pk_tostring,
+                    pk_select = pk_select_list,
+                    hash = ch_hash_expr,
+                    hash_r = ch_hash_expr_rounded,
+                    snap = snapshot_table,
+                    cdc = ch_table,
+                    where = where_clause,
+                    join = pk_join,
+                    lim = max_show - shown_mismatches,
+                ))?.trim().to_string();
+                for line in samples.lines().filter(|l| !l.is_empty()) {
+                    info!("    PK({}) value mismatch", line);
+                    shown_mismatches += 1;
+                }
             }
         }
 
-        (ulp_noise, real_mismatch)
-    } else {
-        (0, 0)
-    };
+        let done_rows = total_matching + total_missing_cdc + total_missing_snap + total_hash_mismatch;
+        let pct = if snap_count > 0 { done_rows as f64 / snap_count as f64 * 100.0 } else { 100.0 };
+        let elapsed = compare_start.elapsed().as_secs_f64();
+        let eta = if pct > 0.0 { (elapsed / pct * 100.0 - elapsed) as u64 } else { 0 };
+
+        let chunk_issues = miss_cdc + miss_snap + chunk_real;
+        let status = if chunk_issues == 0 && chunk_ulp == 0 { "OK" }
+            else if chunk_issues == 0 { &format!("{} ULP noise", chunk_ulp) }
+            else { "MISMATCH" };
+
+        info!(
+            "  [chunk {}/{}]  {} rows  {}  {:.1}%  ETA {}  ({})",
+            chunk_idx + 1, ranges.len(),
+            format_number(h_match + miss_cdc + miss_snap + h_mismatch),
+            status, pct, format_duration(eta), format_duration(chunk_secs)
+        );
+    }
+
+    let hash_mismatch = total_hash_mismatch;
+    let missing_in_cdc = total_missing_cdc;
+    let missing_in_snapshot = total_missing_snap;
+    let matching = total_matching;
+    let ulp_noise = total_ulp_noise;
+    let real_mismatch = total_real_mismatch;
+    let total_issues = missing_in_cdc + missing_in_snapshot + hash_mismatch;
+
+    info!(
+        "  comparison done ({}): {} matching, {} hash mismatches ({} ULP noise, {} real), {} missing in CDC, {} missing in snapshot",
+        format_duration(compare_start.elapsed().as_secs()), format_number(matching),
+        format_number(hash_mismatch), ulp_noise, real_mismatch,
+        format_number(missing_in_cdc), format_number(missing_in_snapshot)
+    );
 
     // ── Version stability check (AFTER all comparison queries) ───────────
     // The CDC table must not have been modified during the entire process
