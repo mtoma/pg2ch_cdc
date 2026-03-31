@@ -39,10 +39,12 @@ pub struct Column {
 
 /// Discover all columns for a table and build matched PG/CH stringify expressions.
 /// Returns (all_columns, pk_column_names_in_order).
+/// `decimal_tolerance`: if set, Decimal columns are rounded to absorb snapshot noise.
 pub fn build_all_columns(
     pg: &pg2ch_cdc::pg::PgClient,
     schema: &str,
     table: &str,
+    decimal_tolerance: Option<f64>,
 ) -> Result<(Vec<Column>, Vec<String>)> {
     // Get PK columns in order
     let pk_rows = pg.query(&format!(
@@ -79,7 +81,7 @@ pub fn build_all_columns(
         let is_pk = pk_names.contains(name);
 
         let (pg_expr, ch_expr, pg_expr_rounded, ch_expr_rounded) =
-            build_expr(name, pg_type, nullable)?;
+            build_expr(name, pg_type, nullable, decimal_tolerance)?;
 
         columns.push(Column {
             name: name.clone(),
@@ -98,7 +100,7 @@ pub fn build_all_columns(
 
 /// Returns (pg_expr, ch_expr, pg_expr_rounded, ch_expr_rounded).
 /// For non-float types, the rounded expressions are identical to the primary ones.
-fn build_expr(name: &str, pg_type: &str, nullable: bool) -> Result<(String, String, String, String)> {
+fn build_expr(name: &str, pg_type: &str, nullable: bool, decimal_tolerance: Option<f64>) -> Result<(String, String, String, String)> {
     let (pg_raw, ch_raw, pg_round, ch_round) = match pg_type {
         // Integers: both sides produce decimal string
         "int2" | "int4" | "int8" => {
@@ -144,11 +146,24 @@ fn build_expr(name: &str, pg_type: &str, nullable: bool) -> Result<(String, Stri
             )
         }
 
-        // Numeric/Decimal: both sides trim trailing zeros similarly
+        // Numeric/Decimal: both sides trim trailing zeros similarly.
+        // The postgresql() snapshot can introduce small rounding errors vs CDC
+        // at the Decimal scale boundary. The rounded fallback truncates to
+        // fewer decimal places to absorb this.
         "numeric" => {
             let pg = format!("{}::text", name);
             let ch = format!("toString({})", name);
-            (pg.clone(), ch.clone(), pg, ch)
+            if let Some(tol) = decimal_tolerance {
+                // Round to one fewer decimal place than the tolerance implies,
+                // so that values within ±tolerance always round to the same result.
+                // 0.0001 → 3 decimals, 0.01 → 1 decimal, 0.1 → 0 decimals
+                let decimals = ((-tol.log10()).ceil() - 1.0).max(0.0) as u32;
+                let pg_r = format!("round({}::numeric, {})::text", name, decimals);
+                let ch_r = format!("toString(round({}, {}))", name, decimals);
+                (pg, ch, pg_r, ch_r)
+            } else {
+                (pg.clone(), ch.clone(), pg, ch)
+            }
         }
 
         // Text types: already text

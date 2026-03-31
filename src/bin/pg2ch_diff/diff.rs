@@ -194,7 +194,7 @@ fn diff_table(
     // 6. Drill down mismatches with rounding fallback
     // 7. Drop temp table
 
-    let (all_columns, pk_names) = col_types::build_all_columns(pg, schema, table)?;
+    let (all_columns, pk_names) = col_types::build_all_columns(pg, schema, table, config.decimal_tolerance)?;
 
     let hash_columns: Vec<&Column> = match table_diff.level {
         DiffLevel::PrimaryKeys => all_columns.iter().filter(|c| c.is_pk).collect(),

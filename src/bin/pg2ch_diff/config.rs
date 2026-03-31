@@ -17,6 +17,11 @@ pub struct DiffConfig {
     /// CH HTTP timeout in seconds (default 86400 = 24h, needed for large snapshots)
     #[serde(default = "default_ch_timeout")]
     pub ch_timeout_secs: u64,
+    /// Tolerance for Decimal column comparison. The postgresql() snapshot can
+    /// introduce small rounding errors vs CDC. Set to 0 for exact match.
+    /// Example: 0.0001 tolerates differences up to ±0.0001.
+    #[serde(default)]
+    pub decimal_tolerance: Option<f64>,
     pub tables: Vec<TableDiff>,
 }
 
