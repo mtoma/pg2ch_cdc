@@ -32,7 +32,7 @@ pub enum DiffStatus {
     Error { detail: String },
 }
 
-pub fn run_diff(config: &DiffConfig) -> Result<Vec<TableResult>> {
+pub fn run_diff(config: &DiffConfig, skip_snapshot: bool) -> Result<Vec<TableResult>> {
     let src = &config.source;
     let dst = &config.destination;
 
@@ -44,7 +44,7 @@ pub fn run_diff(config: &DiffConfig) -> Result<Vec<TableResult>> {
     for table_diff in &config.tables {
         info!("─── {} (level: {:?}) ───", table_diff.name, table_diff.level);
 
-        let result = match diff_table(&pg, &ch, config, table_diff) {
+        let result = match diff_table(&pg, &ch, config, table_diff, skip_snapshot) {
             Ok(r) => r,
             Err(e) => TableResult {
                 table: table_diff.name.clone(),
@@ -92,6 +92,7 @@ fn diff_table(
     ch: &ChClient,
     config: &DiffConfig,
     table_diff: &TableDiff,
+    skip_snapshot: bool,
 ) -> Result<TableResult> {
     let table = &table_diff.name;
     let schema = &config.source.schema;
@@ -149,21 +150,35 @@ fn diff_table(
     }
 
     // ── Level 2: Exact count ────────────────────────────────────────────
-    info!("  counting PG rows (exact)...");
-    let t0 = Instant::now();
-    let pg_exact = pg.query(&format!(
-        "SELECT count(*) FROM {}.{}", schema, table
-    ))?;
-    let pg_count: i64 = pg_exact[0][0].parse().unwrap_or(-1);
-    info!("  PG count: {} ({})", format_number(pg_count), format_duration(t0.elapsed().as_secs()));
+    // Skip expensive PG count for checksum level with --skip-snapshot
+    // (the snapshot count replaces it)
+    let skip_exact_count = skip_snapshot
+        && (table_diff.level == DiffLevel::Checksum || table_diff.level == DiffLevel::PrimaryKeys);
 
-    info!("  counting CH rows (FINAL)...");
-    let t0 = Instant::now();
-    let ch_exact = ch.query(&format!(
-        "SELECT count() FROM {} FINAL FORMAT TabSeparated", ch_table
-    ))?.trim().to_string();
-    let ch_count: i64 = ch_exact.parse().unwrap_or(-1);
-    info!("  CH count: {} ({})", format_number(ch_count), format_duration(t0.elapsed().as_secs()));
+    let pg_count: i64;
+    let ch_count: i64;
+
+    if skip_exact_count {
+        pg_count = pg_est_count; // use estimate, snapshot count will be exact
+        ch_count = pg_est_count; // placeholder, will be checked later
+        info!("  skipping exact counts (--skip-snapshot)");
+    } else {
+        info!("  counting PG rows (exact)...");
+        let t0 = Instant::now();
+        let pg_exact = pg.query(&format!(
+            "SELECT count(*) FROM {}.{}", schema, table
+        ))?;
+        pg_count = pg_exact[0][0].parse().unwrap_or(-1);
+        info!("  PG count: {} ({})", format_number(pg_count), format_duration(t0.elapsed().as_secs()));
+
+        info!("  counting CH rows (FINAL)...");
+        let t0 = Instant::now();
+        let ch_exact = ch.query(&format!(
+            "SELECT count() FROM {} FINAL FORMAT TabSeparated", ch_table
+        ))?.trim().to_string();
+        ch_count = ch_exact.parse().unwrap_or(-1);
+        info!("  CH count: {} ({})", format_number(ch_count), format_duration(t0.elapsed().as_secs()));
+    }
 
     if table_diff.level == DiffLevel::ExactCount {
         return if pg_count == ch_count {
@@ -238,83 +253,98 @@ fn diff_table(
     ))?.trim().to_string();
     info!("  CDC version before snapshot: {}", version_before);
 
-    // Create snapshot with progress monitoring
-    info!("  snapshotting PG via postgresql()...");
-    let t0 = Instant::now();
-
-    // Drop leftover from previous run
-    ch.query(&format!("DROP TABLE IF EXISTS {} SYNC", snapshot_table))?;
-
-    // Create empty table with same structure as CDC table (minus _pg2ch_* columns)
-    let data_columns = ch.query(&format!(
-        "SELECT name, type FROM system.columns \
-         WHERE database = '{}' AND table = '{}' AND name NOT LIKE '_pg2ch%' \
-         ORDER BY position FORMAT TabSeparated",
-        config.destination.database, table
-    ))?.trim().to_string();
-    let col_defs: Vec<String> = data_columns.lines()
-        .filter(|l| !l.is_empty())
-        .map(|l| {
-            let parts: Vec<&str> = l.split('\t').collect();
-            format!("{} {}", parts[0], parts.get(1).unwrap_or(&"String"))
-        })
-        .collect();
-    ch.query(&format!(
-        "CREATE TABLE {} ({}) ENGINE = MergeTree() ORDER BY ({})",
-        snapshot_table, col_defs.join(", "), pk_order
-    ))?;
-
-    // Spawn progress monitor thread
-    let snap_table_clone = snapshot_table.clone();
-    let dst = &config.destination;
-    let monitor_ch = ChClient::new(&dst.host, dst.port, &dst.user, &dst.password, 60);
-    let pg_est_for_monitor = pg_est_count;
-    let stop_monitor = Arc::new(AtomicBool::new(false));
-    let stop_flag = stop_monitor.clone();
-    let monitor_start = Instant::now();
-
-    let monitor = std::thread::spawn(move || {
-        let mut last_count: i64 = 0;
-        while !stop_flag.load(Ordering::Relaxed) {
-            std::thread::sleep(std::time::Duration::from_secs(60));
-            if stop_flag.load(Ordering::Relaxed) { break; }
-            if let Ok(result) = monitor_ch.query(&format!(
-                "SELECT count() FROM {} FORMAT TabSeparated SETTINGS final = 0", snap_table_clone
-            )) {
-                let count: i64 = result.trim().parse().unwrap_or(0);
-                let elapsed = monitor_start.elapsed().as_secs();
-                let rate = if elapsed > 0 { count as f64 / elapsed as f64 } else { 0.0 };
-                let eta = if rate > 0.0 && pg_est_for_monitor > 0 {
-                    ((pg_est_for_monitor as f64 - count as f64) / rate) as u64
-                } else { 0 };
-                let delta = count - last_count;
-                info!(
-                    "  [snapshot] {} rows ({:.0} rows/s, +{} since last, ETA {})",
-                    format_number(count), rate, format_number(delta), format_duration(eta)
-                );
-                last_count = count;
-            }
+    let snap_count;
+    if skip_snapshot {
+        // Reuse existing snapshot table
+        let exists = ch.query(&format!(
+            "EXISTS TABLE {} FORMAT TabSeparated", snapshot_table
+        ))?.trim().to_string();
+        if exists != "1" {
+            bail!("--skip-snapshot: table {} does not exist", snapshot_table);
         }
-    });
+        snap_count = ch.query(&format!(
+            "SELECT count() FROM {} FORMAT TabSeparated", snapshot_table
+        ))?.trim().to_string().parse::<i64>().unwrap_or(-1);
+        info!("  reusing existing snapshot: {} rows", format_number(snap_count));
+    } else {
+        // Create snapshot with progress monitoring
+        info!("  snapshotting PG via postgresql()...");
+        let t0 = Instant::now();
 
-    // Run the actual INSERT
-    ch.query(&format!(
-        "INSERT INTO {} SELECT * FROM {}",
-        snapshot_table, pg_func
-    ))?;
+        // Drop leftover from previous run
+        ch.query(&format!("DROP TABLE IF EXISTS {} SYNC", snapshot_table))?;
 
-    stop_monitor.store(true, Ordering::Relaxed);
-    let _ = monitor.join();
+        // Create empty table with same structure as CDC table (minus _pg2ch_* columns)
+        let data_columns = ch.query(&format!(
+            "SELECT name, type FROM system.columns \
+             WHERE database = '{}' AND table = '{}' AND name NOT LIKE '_pg2ch%' \
+             ORDER BY position FORMAT TabSeparated",
+            config.destination.database, table
+        ))?.trim().to_string();
+        let col_defs: Vec<String> = data_columns.lines()
+            .filter(|l| !l.is_empty())
+            .map(|l| {
+                let parts: Vec<&str> = l.split('\t').collect();
+                format!("{} {}", parts[0], parts.get(1).unwrap_or(&"String"))
+            })
+            .collect();
+        ch.query(&format!(
+            "CREATE TABLE {} ({}) ENGINE = MergeTree() ORDER BY ({})",
+            snapshot_table, col_defs.join(", "), pk_order
+        ))?;
 
-    let snap_secs = t0.elapsed().as_secs();
-    let snap_count = ch.query(&format!(
-        "SELECT count() FROM {} FORMAT TabSeparated", snapshot_table
-    ))?.trim().to_string().parse::<i64>().unwrap_or(-1);
-    let snap_rate = if snap_secs > 0 { snap_count as f64 / snap_secs as f64 } else { 0.0 };
-    info!(
-        "  snapshot: {} rows ({}, {:.0} rows/s)",
-        format_number(snap_count), format_duration(snap_secs), snap_rate
-    );
+        // Spawn progress monitor thread
+        let snap_table_clone = snapshot_table.clone();
+        let dst = &config.destination;
+        let monitor_ch = ChClient::new(&dst.host, dst.port, &dst.user, &dst.password, 60);
+        let pg_est_for_monitor = pg_est_count;
+        let stop_monitor = Arc::new(AtomicBool::new(false));
+        let stop_flag = stop_monitor.clone();
+        let monitor_start = Instant::now();
+
+        let monitor = std::thread::spawn(move || {
+            let mut last_count: i64 = 0;
+            while !stop_flag.load(Ordering::Relaxed) {
+                std::thread::sleep(std::time::Duration::from_secs(60));
+                if stop_flag.load(Ordering::Relaxed) { break; }
+                if let Ok(result) = monitor_ch.query(&format!(
+                    "SELECT count() FROM {} FORMAT TabSeparated", snap_table_clone
+                )) {
+                    let count: i64 = result.trim().parse().unwrap_or(0);
+                    let elapsed = monitor_start.elapsed().as_secs();
+                    let rate = if elapsed > 0 { count as f64 / elapsed as f64 } else { 0.0 };
+                    let eta = if rate > 0.0 && pg_est_for_monitor > 0 {
+                        ((pg_est_for_monitor as f64 - count as f64) / rate) as u64
+                    } else { 0 };
+                    let delta = count - last_count;
+                    info!(
+                        "  [snapshot] {} rows ({:.0} rows/s, +{} since last, ETA {})",
+                        format_number(count), rate, format_number(delta), format_duration(eta)
+                    );
+                    last_count = count;
+                }
+            }
+        });
+
+        // Run the actual INSERT
+        ch.query(&format!(
+            "INSERT INTO {} SELECT * FROM {}",
+            snapshot_table, pg_func
+        ))?;
+
+        stop_monitor.store(true, Ordering::Relaxed);
+        let _ = monitor.join();
+
+        let snap_secs = t0.elapsed().as_secs();
+        snap_count = ch.query(&format!(
+            "SELECT count() FROM {} FORMAT TabSeparated", snapshot_table
+        ))?.trim().to_string().parse::<i64>().unwrap_or(-1);
+        let snap_rate = if snap_secs > 0 { snap_count as f64 / snap_secs as f64 } else { 0.0 };
+        info!(
+            "  snapshot: {} rows ({}, {:.0} rows/s)",
+            format_number(snap_count), format_duration(snap_secs), snap_rate
+        );
+    }
 
     // Count CDC side
     let cdc_count = ch.query(&format!(

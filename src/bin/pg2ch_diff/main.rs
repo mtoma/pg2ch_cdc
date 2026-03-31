@@ -25,6 +25,10 @@ struct Cli {
     /// Plain output (no timestamp/level prefix). Use when running under Airflow.
     #[arg(long)]
     plain: bool,
+
+    /// Skip snapshot creation, reuse existing temp table from a previous run.
+    #[arg(long)]
+    skip_snapshot: bool,
 }
 
 fn main() -> Result<()> {
@@ -50,7 +54,7 @@ fn main() -> Result<()> {
     }
 
     let config = DiffConfig::load(&cli.config)?;
-    let results = run_diff(&config)?;
+    let results = run_diff(&config, cli.skip_snapshot)?;
 
     // ── Summary ─────────────────────────────────────────────────────────
     println!();
