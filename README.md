@@ -190,6 +190,147 @@ The target count is an estimate from PostgreSQL statistics. The loaded count is 
 - The PostgreSQL user must have **replication privileges**
 - PostgreSQL 10+ (uses built-in logical replication)
 
+---
+
+# pg2ch_diff — Data validation tool
+
+Validates that ClickHouse mirrors faithfully reflect PostgreSQL source tables. Compares data cross-database using progressive validation levels — from instant metadata checks to full row-level checksums on billion-row tables.
+
+```bash
+pg2ch_diff --config diffs/my_diff.yaml
+```
+
+## How it works
+
+The key insight: ClickHouse is fast, PostgreSQL is the bottleneck. Rather than hashing rows on both sides independently, pg2ch_diff snapshots the PG table into a temporary ClickHouse table via `postgresql()`, then compares entirely within ClickHouse using `FULL JOIN` + `sipHash64`. This avoids expensive PG table scans for hash computation.
+
+### Validation levels
+
+Each table can be configured with a different validation level. Higher levels give more information but cost more.
+
+| Level | What it checks | PG load | CH load |
+|---|---|---|---|
+| `metadata_count` | `pg_class.reltuples` vs `count()` without FINAL | Instant | Instant |
+| `exact_count` | `count(*)` on both sides | Full seq scan | Moderate (FINAL) |
+| `primary_keys` | PK set comparison via snapshot + sipHash64 on PK columns | Snapshot via `postgresql()` | FULL JOIN |
+| `checksum` | Full row comparison via snapshot + sipHash64 on all columns | Snapshot via `postgresql()` | FULL JOIN |
+
+### Snapshot + compare approach (levels 3-4)
+
+1. Record `max(_pg2ch_version)` on the CDC table (stability marker)
+2. Snapshot PG into a temp CH table: `INSERT INTO temp._diff_{table} SELECT * FROM postgresql(...)`
+3. Compare snapshot vs CDC table in CH using chunked `FULL JOIN` with `sipHash64`
+4. Drill down hash mismatches with rounding fallback (catches float ULP noise)
+5. Verify `_pg2ch_version` didn't change during the process
+6. Drop temp table (unless `--keep-snapshot`)
+
+### Chunked comparison
+
+For large tables (billions of rows), a single `FULL JOIN` would exceed memory. The tool splits the comparison into chunks of ~20M rows each, based on the leading primary key.
+
+Chunk boundaries are computed using ClickHouse's approximate quantile function (`quantilesGK`), which scans the snapshot once without sorting. The accuracy parameter scales with the number of chunks: `max(100, num_chunks * 2)`.
+
+Progress is reported per chunk:
+
+```
+[chunk 3/250]  20.1M rows  OK  1.2%  ETA 45m  (12s)
+[chunk 4/250]  19.8M rows  OK  1.6%  ETA 44m  (11s)
+```
+
+### Float handling
+
+The `postgresql()` table function can introduce small ULP (unit in the last place) differences in floating-point values compared to CDC. The tool handles this in two stages:
+
+1. **Primary comparison**: bit-masks the last N mantissa bits of floats before hashing (Float32: 6 bits, Float64: 14 bits)
+2. **Rounding fallback**: rows that still mismatch are re-checked with `round()` to catch mantissa overflow cases
+
+Rows that match after rounding are reported as "ULP noise" (not real mismatches).
+
+### Decimal tolerance
+
+The snapshot can also introduce small rounding errors in `Decimal` columns at the scale boundary. Set `decimal_tolerance` in the config to absorb this:
+
+```yaml
+decimal_tolerance: 0.0001  # tolerates ±0.0001 difference
+```
+
+## Diff config
+
+Diff configs live in `diffs/`. They reuse the same source/destination format as mirror configs, with per-table validation levels.
+
+```yaml
+mirror_name: my_mirror
+
+source:
+  host: pg-host
+  port: 5432
+  database: my_database
+  user: my_user
+  password: secret
+  schema: public
+
+destination:
+  host: ch-host
+  port: 8123
+  database: my_ch_database
+  user: default
+  password: secret
+
+# Optional: separate database for temporary snapshot tables (default: destination database)
+temp_database: temp
+
+# Optional: ClickHouse HTTP timeout in seconds (default: 86400 = 24h)
+ch_timeout_secs: 86400
+
+# Optional: tolerance for Decimal column rounding noise
+decimal_tolerance: 0.0001
+
+tables:
+  - name: small_table
+    level: exact_count
+  - name: big_table
+    level: checksum
+  - name: append_only_table
+    level: primary_keys
+```
+
+## CLI flags
+
+| Flag | Description |
+|---|---|
+| `--config <path>` | Path to the YAML diff config |
+| `--plain` | Plain output without timestamps (for Airflow/cron) |
+| `--skip-snapshot` | Reuse existing snapshot table from a previous run (errors if not found) |
+| `--keep-snapshot` | Don't drop the snapshot table after comparison |
+
+`--keep-snapshot` and `--skip-snapshot` are useful together: first run creates and keeps the snapshot, subsequent runs reuse it to iterate on comparison without re-reading PG.
+
+## Output
+
+The tool prints per-table progress and a summary:
+
+```
+═══ Summary ═══════════════════════════════════════════════════
+TABLE                               LEVEL  RESULT
+──────────────────────────────────────────────────────────────────────
+small_table                    ExactCount  OK — both have 1.2M rows
+big_table                        Checksum  OK — 2.1B matching, 0 mismatches
+append_only_table              PrimaryKeys  OK — 500.0M matching, 0 mismatches
+──────────────────────────────────────────────────────────────────────
+3 tables checked: 3 ok, 0 mismatches, 0 errors
+```
+
+Exit code is 0 if all tables match, 1 if any mismatch or error.
+
+## Source files
+
+| File | Purpose |
+|---|---|
+| `src/bin/pg2ch_diff/main.rs` | CLI parsing, tracing init, summary output |
+| `src/bin/pg2ch_diff/config.rs` | YAML config with per-table diff levels |
+| `src/bin/pg2ch_diff/diff.rs` | Diff engine — snapshot, chunked comparison, hash drilldown |
+| `src/bin/pg2ch_diff/col_types.rs` | Type-aware column expressions for cross-database hash comparison |
+
 ## Naming conventions
 
 - Publication: `pg2ch_{mirror_name}`

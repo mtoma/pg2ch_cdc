@@ -11,6 +11,15 @@
 | `pgoutput.rs` | Binary pgoutput protocol parser (Relation/Insert/Update/Delete/Begin/Commit) |
 | `types.rs` | PG→CH type conversion: text mode, binary wire format, numeric, timestamptz |
 
+## pg2ch_diff (validation tool)
+
+| File | Purpose |
+|------|---------|
+| `src/bin/pg2ch_diff/main.rs` | CLI (`--config`, `--plain`, `--skip-snapshot`, `--keep-snapshot`), summary output |
+| `src/bin/pg2ch_diff/config.rs` | Diff-specific YAML config: per-table diff levels, temp_database, decimal_tolerance |
+| `src/bin/pg2ch_diff/diff.rs` | Diff engine: snapshot PG via `postgresql()`, chunked `FULL JOIN` + `sipHash64`, rounding drilldown |
+| `src/bin/pg2ch_diff/col_types.rs` | Type-aware stringify expressions: float bit-masking, timestamp normalization, NULL handling |
+
 ## YAML config
 
 One file per mirror in `mirrors/`. Example:

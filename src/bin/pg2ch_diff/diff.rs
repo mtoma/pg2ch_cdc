@@ -388,18 +388,22 @@ fn diff_table(
     let target_chunk_rows: i64 = 20_000_000;
     let num_chunks = ((snap_count / target_chunk_rows) + 1).max(1) as usize;
 
-    // Build chunk boundaries by sampling the snapshot's leading PK
+    // Build chunk boundaries using approximate quantiles (Greenwald-Khanna).
+    // Much faster than rowNumberInAllBlocks() ORDER BY — avoids full sort.
     let boundaries: Vec<String> = if num_chunks <= 1 {
         vec![] // single chunk, no boundaries needed
     } else {
+        // Build quantile fractions: 1/N, 2/N, ..., (N-1)/N
+        let fractions: Vec<String> = (1..num_chunks)
+            .map(|i| format!("{:.10}", i as f64 / num_chunks as f64))
+            .collect();
+        let gk_accuracy = (num_chunks * 2).max(100);
         let boundary_result = ch.query(&format!(
-            "SELECT {pk} FROM (\
-               SELECT {pk}, rowNumberInAllBlocks() as rn \
-               FROM {snap} ORDER BY {pk}\
-             ) WHERE rn % {chunk_size} = 0 AND rn > 0 \
-             FORMAT TabSeparated",
+            "SELECT arrayJoin(quantilesGK({accuracy}, {fracs})({pk})) \
+             FROM {snap} FORMAT TabSeparated",
+            accuracy = gk_accuracy,
+            fracs = fractions.join(", "),
             pk = lead_pk, snap = snapshot_table,
-            chunk_size = snap_count / num_chunks as i64,
         ))?.trim().to_string();
         boundary_result.lines()
             .filter(|l| !l.is_empty())
