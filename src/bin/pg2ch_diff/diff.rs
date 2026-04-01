@@ -32,7 +32,7 @@ pub enum DiffStatus {
     Error { detail: String },
 }
 
-pub fn run_diff(config: &DiffConfig, skip_snapshot: bool) -> Result<Vec<TableResult>> {
+pub fn run_diff(config: &DiffConfig, skip_snapshot: bool, keep_snapshot: bool) -> Result<Vec<TableResult>> {
     let src = &config.source;
     let dst = &config.destination;
 
@@ -44,7 +44,7 @@ pub fn run_diff(config: &DiffConfig, skip_snapshot: bool) -> Result<Vec<TableRes
     for table_diff in &config.tables {
         info!("─── {} (level: {:?}) ───", table_diff.name, table_diff.level);
 
-        let result = match diff_table(&pg, &ch, config, table_diff, skip_snapshot) {
+        let result = match diff_table(&pg, &ch, config, table_diff, skip_snapshot, keep_snapshot) {
             Ok(r) => r,
             Err(e) => TableResult {
                 table: table_diff.name.clone(),
@@ -93,6 +93,7 @@ fn diff_table(
     config: &DiffConfig,
     table_diff: &TableDiff,
     skip_snapshot: bool,
+    keep_snapshot: bool,
 ) -> Result<TableResult> {
     let table = &table_diff.name;
     let schema = &config.source.schema;
@@ -272,7 +273,9 @@ fn diff_table(
         let t0 = Instant::now();
 
         // Drop leftover from previous run
+        if !keep_snapshot {
         ch.query(&format!("DROP TABLE IF EXISTS {} SYNC", snapshot_table))?;
+    }
 
         // Create empty table with same structure as CDC table (minus _pg2ch_* columns)
         let data_columns = ch.query(&format!(
@@ -356,7 +359,9 @@ fn diff_table(
             "count mismatch: snapshot {} / CDC {} (diff {})",
             format_number(snap_count), format_number(cdc_count), snap_count - cdc_count
         );
+        if !keep_snapshot {
         ch.query(&format!("DROP TABLE IF EXISTS {} SYNC", snapshot_table))?;
+    }
         return Ok(TableResult {
             table: table.clone(),
             level: table_diff.level.clone(),
@@ -569,7 +574,9 @@ fn diff_table(
         ch_table
     ))?.trim().to_string();
 
-    ch.query(&format!("DROP TABLE IF EXISTS {} SYNC", snapshot_table))?;
+    if !keep_snapshot {
+        ch.query(&format!("DROP TABLE IF EXISTS {} SYNC", snapshot_table))?;
+    }
 
     if version_before != version_after {
         return Ok(TableResult {

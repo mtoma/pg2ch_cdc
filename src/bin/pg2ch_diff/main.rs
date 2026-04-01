@@ -29,6 +29,10 @@ struct Cli {
     /// Skip snapshot creation, reuse existing temp table from a previous run.
     #[arg(long)]
     skip_snapshot: bool,
+
+    /// Keep snapshot table after comparison (don't drop it).
+    #[arg(long)]
+    keep_snapshot: bool,
 }
 
 fn main() -> Result<()> {
@@ -54,7 +58,7 @@ fn main() -> Result<()> {
     }
 
     let config = DiffConfig::load(&cli.config)?;
-    let results = run_diff(&config, cli.skip_snapshot)?;
+    let results = run_diff(&config, cli.skip_snapshot, cli.keep_snapshot)?;
 
     // ── Summary ─────────────────────────────────────────────────────────
     println!();
