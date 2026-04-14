@@ -622,16 +622,18 @@ pub fn drain_cdc(cfg: &CdcConfig) -> Result<u64> {
                     0.0
                 };
 
-                let state = if walsender_sent > last_processed_lsn && total_wal_msgs > 0 {
-                    let buffered_gb = walsender_sent.saturating_sub(last_processed_lsn) as f64 / 1_073_741_824.0;
-                    let remaining_gb = target_lsn.saturating_sub(walsender_sent) as f64 / 1_073_741_824.0;
-                    format!(" [flushing {:.2} GB buffered, {:.2} GB remaining]", buffered_gb, remaining_gb)
-                } else if effective_lsn > last_processed_lsn {
-                    let remaining_gb = target_lsn.saturating_sub(effective_lsn) as f64 / 1_073_741_824.0;
-                    format!(" [PG decoding: {:.2} GB remaining]", remaining_gb)
+                // GB values are WAL position distances (LSN gaps). PG scans all WAL
+                // server-side, filtering to our publication. Most WAL is for other
+                // tables — sent_lsn advances through it without sending us data.
+                let remaining_gb = target_lsn.saturating_sub(effective_lsn.min(target_lsn)) as f64 / 1_073_741_824.0;
+                let past_target_gb = walsender_sent.saturating_sub(target_lsn) as f64 / 1_073_741_824.0;
+                let past_target_str = if past_target_gb >= 0.01 {
+                    format!(", {:.2} GB new WAL since target", past_target_gb)
                 } else {
                     String::new()
                 };
+
+                let state = format!(" [{:.2} GB WAL remaining{}]", remaining_gb, past_target_str);
 
                 (format!("{:.1}%", cdc_pct), state)
             };
