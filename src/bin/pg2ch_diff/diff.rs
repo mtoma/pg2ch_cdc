@@ -151,17 +151,83 @@ fn diff_table(
     }
 
     // ── Level 2: Exact count ────────────────────────────────────────────
-    // Skip expensive PG count for checksum level with --skip-snapshot
-    // (the snapshot count replaces it)
-    let skip_exact_count = skip_snapshot
-        && (table_diff.level == DiffLevel::Checksum || table_diff.level == DiffLevel::PrimaryKeys);
+    // Protect against concurrent CDC writes: snapshot _pg2ch_version before
+    // and after the counts; if it changed, the CH side moved during the count
+    // and the result may be falsely a mismatch. Retry up to 3 times.
+    if table_diff.level == DiffLevel::ExactCount {
+        for attempt in 1..=3 {
+            let version_before = ch.query(&format!(
+                "SELECT max(_pg2ch_version) FROM {} SETTINGS final = 0 FORMAT TabSeparated",
+                ch_table
+            ))?.trim().to_string();
 
-    let pg_count: i64;
-    let ch_count: i64;
+            info!("  counting PG rows (exact)...");
+            let t0 = Instant::now();
+            let pg_exact = pg.query(&format!(
+                "SELECT count(*) FROM {}.{}", schema, table
+            ))?;
+            let pg_count: i64 = pg_exact[0][0].parse().unwrap_or(-1);
+            info!("  PG count: {} ({})", format_number(pg_count), format_duration(t0.elapsed().as_secs()));
+
+            info!("  counting CH rows (FINAL)...");
+            let t0 = Instant::now();
+            let ch_exact = ch.query(&format!(
+                "SELECT count() FROM {} FINAL FORMAT TabSeparated", ch_table
+            ))?.trim().to_string();
+            let ch_count: i64 = ch_exact.parse().unwrap_or(-1);
+            info!("  CH count: {} ({})", format_number(ch_count), format_duration(t0.elapsed().as_secs()));
+
+            let version_after = ch.query(&format!(
+                "SELECT max(_pg2ch_version) FROM {} SETTINGS final = 0 FORMAT TabSeparated",
+                ch_table
+            ))?.trim().to_string();
+
+            if version_before == version_after {
+                return if pg_count == ch_count {
+                    Ok(TableResult {
+                        table: table.clone(),
+                        level: DiffLevel::ExactCount,
+                        status: DiffStatus::Match {
+                            detail: format!("both have {} rows", format_number(pg_count)),
+                        },
+                    })
+                } else {
+                    Ok(TableResult {
+                        table: table.clone(),
+                        level: DiffLevel::ExactCount,
+                        status: DiffStatus::Mismatch {
+                            detail: format!("PG {} / CH {} (diff {})", format_number(pg_count), format_number(ch_count), pg_count - ch_count),
+                        },
+                    })
+                };
+            }
+
+            warn!(
+                "  CDC version changed during count ({} → {}), attempt {}/3 — retrying",
+                version_before, version_after, attempt
+            );
+        }
+
+        return Ok(TableResult {
+            table: table.clone(),
+            level: DiffLevel::ExactCount,
+            status: DiffStatus::Error {
+                detail: "CDC version kept changing across 3 count attempts — table under heavy write load, retry later".to_string(),
+            },
+        });
+    }
+
+    // ── Counts for higher levels (PrimaryKeys / Checksum) ───────────────
+    // These levels do their own version-protected comparison later. The
+    // counts here are advisory progress logs, except when --skip-snapshot
+    // is used (then they're skipped — snapshot count replaces them).
+    let skip_exact_count = skip_snapshot;
+    let _pg_count: i64;
+    let _ch_count: i64;
 
     if skip_exact_count {
-        pg_count = pg_est_count; // use estimate, snapshot count will be exact
-        ch_count = pg_est_count; // placeholder, will be checked later
+        _pg_count = pg_est_count;
+        _ch_count = pg_est_count;
         info!("  skipping exact counts (--skip-snapshot)");
     } else {
         info!("  counting PG rows (exact)...");
@@ -169,36 +235,16 @@ fn diff_table(
         let pg_exact = pg.query(&format!(
             "SELECT count(*) FROM {}.{}", schema, table
         ))?;
-        pg_count = pg_exact[0][0].parse().unwrap_or(-1);
-        info!("  PG count: {} ({})", format_number(pg_count), format_duration(t0.elapsed().as_secs()));
+        _pg_count = pg_exact[0][0].parse().unwrap_or(-1);
+        info!("  PG count: {} ({})", format_number(_pg_count), format_duration(t0.elapsed().as_secs()));
 
         info!("  counting CH rows (FINAL)...");
         let t0 = Instant::now();
         let ch_exact = ch.query(&format!(
             "SELECT count() FROM {} FINAL FORMAT TabSeparated", ch_table
         ))?.trim().to_string();
-        ch_count = ch_exact.parse().unwrap_or(-1);
-        info!("  CH count: {} ({})", format_number(ch_count), format_duration(t0.elapsed().as_secs()));
-    }
-
-    if table_diff.level == DiffLevel::ExactCount {
-        return if pg_count == ch_count {
-            Ok(TableResult {
-                table: table.clone(),
-                level: DiffLevel::ExactCount,
-                status: DiffStatus::Match {
-                    detail: format!("both have {} rows", format_number(pg_count)),
-                },
-            })
-        } else {
-            Ok(TableResult {
-                table: table.clone(),
-                level: DiffLevel::ExactCount,
-                status: DiffStatus::Mismatch {
-                    detail: format!("PG {} / CH {} (diff {})", format_number(pg_count), format_number(ch_count), pg_count - ch_count),
-                },
-            })
-        };
+        _ch_count = ch_exact.parse().unwrap_or(-1);
+        info!("  CH count: {} ({})", format_number(_ch_count), format_duration(t0.elapsed().as_secs()));
     }
 
     // ── Levels 3 & 4: Snapshot + CH-vs-CH comparison ─────────────────────
