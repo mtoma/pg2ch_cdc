@@ -431,7 +431,10 @@ pub fn run_mirror(config: &MirrorConfig) -> Result<()> {
                         None
                     };
 
-                    let result = ch.query(&insert);
+                    // Initial bulk load via postgresql() can take many hours on
+                    // billion-row tables. Override the configured timeout to 24h
+                    // so a slow PG side doesn't kill the load and force a restart.
+                    let result = ch.query_with_timeout(&insert, 86400);
                     stop_monitor.store(true, Ordering::Relaxed);
                     if let Some(h) = monitor_handle {
                         let _ = h.join();

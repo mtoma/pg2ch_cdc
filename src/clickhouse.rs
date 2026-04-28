@@ -47,6 +47,29 @@ impl ChClient {
         Ok(resp.text().unwrap_or_default())
     }
 
+    /// Run a query with a one-shot HTTP client using the given timeout.
+    /// Use for long-running queries (initial loads via postgresql()) that
+    /// can exceed the configured `ch_timeout_secs`.
+    pub fn query_with_timeout(&self, sql: &str, timeout_secs: u64) -> Result<String> {
+        let sql_preview: String = sql.chars().take(200).collect();
+        let client = reqwest::blocking::Client::builder()
+            .timeout(std::time::Duration::from_secs(timeout_secs))
+            .build()
+            .context("Failed to build long-timeout HTTP client")?;
+        let resp = client
+            .post(&self.base_url)
+            .basic_auth(&self.user, Some(&self.password))
+            .body(sql.to_string())
+            .send()
+            .with_context(|| format!("ClickHouse HTTP request failed: {}", sql_preview))?;
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let body = resp.text().unwrap_or_default();
+            bail!("ClickHouse error ({}) for [{}]: {}", status, sql_preview, body);
+        }
+        Ok(resp.text().unwrap_or_default())
+    }
+
     pub fn insert_tsv(&self, table: &str, columns: &str, tsv_data: &str) -> Result<()> {
         let query = format!(
             "INSERT INTO {} ({}) FORMAT TabSeparated",
