@@ -467,17 +467,39 @@ pub fn drain_cdc(cfg: &CdcConfig) -> Result<u64> {
                                 let msg_type = payload[0] as char;
                                 match msg_type {
                                     'T' => {
-                                        // TRUNCATE: parse relation IDs to log which tables
+                                        // TRUNCATE: drop in-memory pending rows for the affected
+                                        // tables, then TRUNCATE the corresponding CH tables.
+                                        // Subsequent INSERTs from the same transaction will
+                                        // repopulate the now-empty CH tables correctly.
                                         let truncated = parse_truncate_rel_ids(&payload[1..]);
-                                        let names: Vec<String> = truncated.iter()
-                                            .map(|id| rel_to_table.get(id)
-                                                .cloned()
-                                                .unwrap_or_else(|| format!("rel_id={}", id)))
-                                            .collect();
-                                        warn!(
-                                            "TRUNCATE received for {} table(s): {} — NOT HANDLED, CH data may diverge",
-                                            truncated.len(), names.join(", ")
-                                        );
+                                        for rel_id in &truncated {
+                                            let table_name = match rel_to_table.get(rel_id) {
+                                                Some(n) => n.clone(),
+                                                None => {
+                                                    warn!("TRUNCATE for unknown rel_id {} — ignoring", rel_id);
+                                                    continue;
+                                                }
+                                            };
+                                            if stale_rel_ids.contains(rel_id) {
+                                                debug!("Skipping TRUNCATE for stale rel_id {}", rel_id);
+                                                continue;
+                                            }
+                                            let batch = match batches.get_mut(&table_name) {
+                                                Some(b) => b,
+                                                None => {
+                                                    debug!("TRUNCATE for non-mirrored table '{}' — ignoring", table_name);
+                                                    continue;
+                                                }
+                                            };
+                                            let ch_table = batch.ch_table_name().to_string();
+                                            let dropped = batch.pending_count();
+                                            batch.discard_pending();
+                                            ch.query(&format!("TRUNCATE TABLE {} SYNC", ch_table))?;
+                                            info!(
+                                                "TRUNCATE applied to {} (dropped {} buffered rows)",
+                                                ch_table, dropped
+                                            );
+                                        }
                                     }
                                     'O' | 'Y' => {} // Origin, Type — safe to skip silently
                                     other => {

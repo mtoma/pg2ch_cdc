@@ -216,6 +216,13 @@ impl CdcBatch {
         &self.ch_table
     }
 
+    /// Drop all pending in-memory rows without flushing. Used when a TRUNCATE
+    /// arrives for this table — buffered rows from before the truncate are
+    /// about to be wiped server-side anyway.
+    pub fn discard_pending(&mut self) {
+        self.rows.clear();
+    }
+
     pub fn flush(&mut self, ch: &ChClient) -> Result<()> {
         if self.rows.is_empty() {
             return Ok(());
