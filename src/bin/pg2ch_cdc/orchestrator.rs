@@ -255,13 +255,57 @@ pub fn run_mirror(config: &MirrorConfig) -> Result<()> {
     }
     info!("{}", "─".repeat(80));
 
-    // ── Create CH tables + truncate partial loads ────────────────────────
+    // ── Create CH tables + truncate partial loads + heal schema drift ───
     for ti in &tables_to_load {
         let ch_table = config.ch_table_name(&ti.table);
+
         if !ti.ch_table_exists {
             create_ch_table(&ch, config, &ti.table, &ch_table, &ti.pk_cols)?;
+            continue;
         }
-        if ti.reload_reason != ReloadReason::None {
+
+        // CH table exists. Before loading, compare its current schema (data
+        // cols only — ignoring _pg2ch_* meta) against PG's current schema.
+        // If they differ (column added/removed/renamed/retyped on PG),
+        // drop + recreate to match the latest PG schema. Safe because the
+        // table is either empty (LOAD) or about to be wiped (RELOAD).
+        let (ch_db, ch_tbl) = ch_table.split_once('.').unwrap_or(("default", &ch_table));
+        let ch_schema_raw = ch.query(&format!(
+            "SELECT name, type FROM system.columns \
+             WHERE database='{}' AND table='{}' AND name NOT LIKE '_pg2ch_%' \
+             ORDER BY position FORMAT TabSeparated",
+            ch_db, ch_tbl
+        ))?;
+        let ch_schema: Vec<(String, String)> = ch_schema_raw.lines()
+            .filter(|l| !l.is_empty())
+            .filter_map(|line| {
+                let mut p = line.split('\t');
+                Some((p.next()?.to_string(), p.next()?.to_string()))
+            })
+            .collect();
+
+        let pg_schema_raw = ch.query(&format!(
+            "DESCRIBE TABLE postgresql('{}:{}', '{}', '{}', '{}', '{}', '{}') FORMAT TabSeparated",
+            src.host, src.port, src.database, ti.table, src.user, src.password, src.schema
+        ))?;
+        let pg_schema: Vec<(String, String)> = pg_schema_raw.lines()
+            .filter(|l| !l.is_empty())
+            .filter_map(|line| {
+                let mut p = line.split('\t');
+                Some((p.next()?.to_string(), p.next()?.to_string()))
+            })
+            .collect();
+
+        if ch_schema != pg_schema {
+            warn!(
+                "Schema drift on {}: dropping and recreating from current PG schema",
+                ch_table
+            );
+            warn!("  CH had ({} cols): {:?}", ch_schema.len(), ch_schema);
+            warn!("  PG now ({} cols): {:?}", pg_schema.len(), pg_schema);
+            ch.query(&format!("DROP TABLE {} SYNC", ch_table))?;
+            create_ch_table(&ch, config, &ti.table, &ch_table, &ti.pk_cols)?;
+        } else if ti.reload_reason != ReloadReason::None {
             warn!("Truncating {} (reload scheduled)", ch_table);
             ch.query(&format!("TRUNCATE TABLE {}", ch_table))?;
         }
