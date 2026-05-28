@@ -59,7 +59,7 @@ pub fn run_mirror(config: &MirrorConfig) -> Result<()> {
                ORDER BY i.indisprimary DESC, array_length(i.indkey, 1) ASC \
                LIMIT 1 \
              ) \
-             SELECT a.attname, p.indisprimary::text, p.index_name \
+             SELECT a.attname, p.indisprimary, p.index_name \
              FROM pick p \
              JOIN pg_attribute a ON a.attrelid = p.indrelid AND a.attnum = ANY(p.indkey) \
              ORDER BY array_position(p.indkey, a.attnum)",
