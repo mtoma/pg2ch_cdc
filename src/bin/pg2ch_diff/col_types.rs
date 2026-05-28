@@ -46,26 +46,34 @@ pub fn build_all_columns(
     table: &str,
     decimal_tolerance: Option<f64>,
 ) -> Result<(Vec<Column>, Vec<String>)> {
-    // Identity columns in order: PK (with relreplident='d') or
-    // the index used by REPLICA IDENTITY USING INDEX (relreplident='i').
-    // Mirrors the orchestrator's logic so JOIN keys match CDC ORDER BY.
+    // Identity columns: PK if present, else smallest unique non-partial
+    // non-expression index with all NOT NULL columns. Same priority as
+    // the orchestrator so JOIN keys match CDC ORDER BY.
     let pk_rows = pg.query(&format!(
-        "SELECT a.attname \
-         FROM pg_class c \
-         JOIN pg_index i ON i.indrelid = c.oid \
-         JOIN pg_attribute a ON a.attrelid = i.indrelid AND a.attnum = ANY(i.indkey) \
-         WHERE c.oid = '{}.{}'::regclass \
-           AND ((c.relreplident = 'd' AND i.indisprimary) OR \
-                (c.relreplident = 'i' AND i.indexrelid = c.relrepidentindex)) \
-         ORDER BY array_position(i.indkey, a.attnum)",
+        "WITH pick AS ( \
+           SELECT i.indrelid, i.indkey \
+           FROM pg_index i \
+           WHERE i.indrelid = '{}.{}'::regclass \
+             AND (i.indisprimary OR ( \
+                   i.indisunique AND i.indexprs IS NULL AND i.indpred IS NULL \
+                   AND NOT EXISTS ( \
+                     SELECT 1 FROM pg_attribute a \
+                     WHERE a.attrelid = i.indrelid AND a.attnum = ANY(i.indkey) \
+                       AND NOT a.attnotnull))) \
+           ORDER BY i.indisprimary DESC, array_length(i.indkey, 1) ASC \
+           LIMIT 1 \
+         ) \
+         SELECT a.attname FROM pick p \
+         JOIN pg_attribute a ON a.attrelid = p.indrelid AND a.attnum = ANY(p.indkey) \
+         ORDER BY array_position(p.indkey, a.attnum)",
         schema, table
     ))?;
     let pk_names: Vec<String> = pk_rows.iter().map(|r| r[0].clone()).collect();
 
     if pk_names.is_empty() {
         bail!(
-            "Table {}.{} has no usable replica identity key \
-             (no PK and no REPLICA IDENTITY USING INDEX)",
+            "Table {}.{} has no primary key and no usable unique index \
+             (a usable unique index is non-partial, non-expression, with all NOT NULL columns)",
             schema, table
         );
     }

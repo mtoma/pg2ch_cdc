@@ -51,7 +51,7 @@ pub fn run_mirror(config: &MirrorConfig) -> Result<()> {
                FROM pg_index i \
                WHERE i.indrelid = '{}.{}'::regclass \
                  AND (i.indisprimary OR ( \
-                       i.indisunique AND NOT i.indisexpression AND NOT i.indispartial \
+                       i.indisunique AND i.indexprs IS NULL AND i.indpred IS NULL \
                        AND NOT EXISTS ( \
                          SELECT 1 FROM pg_attribute a \
                          WHERE a.attrelid = i.indrelid AND a.attnum = ANY(i.indkey) \
