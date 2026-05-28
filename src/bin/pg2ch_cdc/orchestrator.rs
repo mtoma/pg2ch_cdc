@@ -34,70 +34,91 @@ pub fn run_mirror(config: &MirrorConfig) -> Result<()> {
     ch.query(&format!("CREATE DATABASE IF NOT EXISTS {}", dst.database))?;
 
     // ── Validate replica identity keys ──────────────────────────────────
-    // Accept either a PRIMARY KEY (REPLICA IDENTITY DEFAULT) or a UNIQUE
-    // index designated via REPLICA IDENTITY USING INDEX. The columns
-    // returned must match what PG sends in WAL OLD images for UPDATE/DELETE.
+    // Priority for identity-column selection:
+    //   1. PRIMARY KEY if present
+    //   2. else: smallest UNIQUE non-partial non-expression index with all
+    //      columns NOT NULL
+    //   3. else: bail
+    // After selection, verify PG's relreplident actually carries those
+    // columns in WAL OLD images (bail with a fix-it ALTER otherwise).
     info!("Validating replica identity keys...");
     let mut table_pks: Vec<(String, Vec<String>)> = Vec::new();
     for table in &config.tables {
         let rows = pg.query(&format!(
-            "SELECT a.attname \
-             FROM pg_class c \
-             JOIN pg_index i ON i.indrelid = c.oid \
-             JOIN pg_attribute a ON a.attrelid = i.indrelid AND a.attnum = ANY(i.indkey) \
-             WHERE c.oid = '{}.{}'::regclass \
-               AND ((c.relreplident = 'd' AND i.indisprimary) OR \
-                    (c.relreplident = 'i' AND i.indexrelid = c.relrepidentindex)) \
-             ORDER BY array_position(i.indkey, a.attnum)",
+            "WITH pick AS ( \
+               SELECT i.indrelid, i.indkey, i.indisprimary, \
+                      i.indexrelid::regclass::text AS index_name \
+               FROM pg_index i \
+               WHERE i.indrelid = '{}.{}'::regclass \
+                 AND (i.indisprimary OR ( \
+                       i.indisunique AND NOT i.indisexpression AND NOT i.indispartial \
+                       AND NOT EXISTS ( \
+                         SELECT 1 FROM pg_attribute a \
+                         WHERE a.attrelid = i.indrelid AND a.attnum = ANY(i.indkey) \
+                           AND NOT a.attnotnull))) \
+               ORDER BY i.indisprimary DESC, array_length(i.indkey, 1) ASC \
+               LIMIT 1 \
+             ) \
+             SELECT a.attname, p.indisprimary::text, p.index_name \
+             FROM pick p \
+             JOIN pg_attribute a ON a.attrelid = p.indrelid AND a.attnum = ANY(p.indkey) \
+             ORDER BY array_position(p.indkey, a.attnum)",
             src.schema, table
         ))?;
+
         if rows.is_empty() {
-            // Diagnose the specific problem and emit a helpful error
-            let diag = pg.query(&format!(
-                "SELECT c.relreplident::text, \
-                        EXISTS (SELECT 1 FROM pg_index WHERE indrelid = c.oid AND indisprimary)::text, \
-                        COALESCE((SELECT i.indexrelid::regclass::text \
-                                  FROM pg_index i \
-                                  WHERE i.indrelid = c.oid \
-                                    AND i.indisunique AND NOT i.indisexpression AND NOT i.indispartial \
-                                    AND NOT EXISTS ( \
-                                      SELECT 1 FROM pg_attribute a \
-                                      WHERE a.attrelid = i.indrelid AND a.attnum = ANY(i.indkey) \
-                                        AND NOT a.attnotnull) \
-                                  ORDER BY array_length(i.indkey, 1) ASC LIMIT 1), '') \
-                 FROM pg_class c WHERE c.oid = '{}.{}'::regclass",
+            bail!(
+                "Table {}.{} has no primary key and no usable unique index \
+                 (a usable unique index is non-partial, non-expression, with all NOT NULL columns)",
                 src.schema, table
-            ))?;
-            let ri = diag[0][0].as_str();
-            let has_pk = diag[0][1] == "t";
-            let suggested = diag[0][2].as_str();
-            match (ri, has_pk, suggested.is_empty()) {
-                ("d", false, false) => bail!(
-                    "Table {}.{} has no primary key. Fix on the PG side: \
-                     ALTER TABLE {}.{} REPLICA IDENTITY USING INDEX {};",
-                    src.schema, table, src.schema, table, suggested
-                ),
-                ("d", false, true) => bail!(
-                    "Table {}.{} has no primary key and no usable unique index \
-                     (all columns of the unique index must be NOT NULL).",
-                    src.schema, table
-                ),
-                ("n", _, _) => bail!(
-                    "Table {}.{} has REPLICA IDENTITY NOTHING — UPDATE/DELETE \
-                     cannot be replicated. Fix: ALTER TABLE {}.{} REPLICA IDENTITY DEFAULT;",
-                    src.schema, table, src.schema, table
-                ),
-                ("f", _, _) => bail!(
-                    "Table {}.{} has REPLICA IDENTITY FULL — not yet supported.",
-                    src.schema, table
-                ),
-                _ => bail!(
-                    "Table {}.{} has no usable replica identity key (relreplident={}, has_pk={}).",
-                    src.schema, table, ri, has_pk
-                ),
-            }
+            );
         }
+
         let pk_cols: Vec<String> = rows.iter().map(|r| r[0].clone()).collect();
+        let is_pk = rows[0][1] == "t";
+        let index_name = rows[0][2].clone();
+
+        // Verify the chosen index's columns will actually be in WAL OLD images.
+        let ri_rows = pg.query(&format!(
+            "SELECT c.relreplident::text, \
+                    COALESCE((SELECT i.indexrelid::regclass::text \
+                              FROM pg_index i \
+                              WHERE i.indrelid = c.oid AND i.indisreplident), '') \
+             FROM pg_class c WHERE c.oid = '{}.{}'::regclass",
+            src.schema, table
+        ))?;
+        let relreplident = ri_rows[0][0].as_str();
+        let ri_index = ri_rows[0][1].as_str();
+
+        let compatible = match (is_pk, relreplident) {
+            // PK is in WAL for DEFAULT or FULL
+            (true, "d") | (true, "f") => true,
+            // Chosen unique index is in WAL if PG points at THAT index, or FULL (carries all)
+            (false, "i") if ri_index == index_name => true,
+            (false, "f") => true,
+            _ => false,
+        };
+
+        if !compatible {
+            let fix = if is_pk {
+                format!("ALTER TABLE {}.{} REPLICA IDENTITY DEFAULT;", src.schema, table)
+            } else {
+                format!(
+                    "ALTER TABLE {}.{} REPLICA IDENTITY USING INDEX {};",
+                    src.schema, table, index_name.rsplit('.').next().unwrap_or(&index_name)
+                )
+            };
+            bail!(
+                "Table {}.{}: chosen identity {} ({}) won't be in WAL OLD images \
+                 (relreplident='{}'). Fix on PG side: {}",
+                src.schema, table,
+                if is_pk { "PK" } else { "UNIQUE index" },
+                index_name,
+                relreplident,
+                fix
+            );
+        }
+
         table_pks.push((table.clone(), pk_cols));
     }
 
