@@ -46,19 +46,28 @@ pub fn build_all_columns(
     table: &str,
     decimal_tolerance: Option<f64>,
 ) -> Result<(Vec<Column>, Vec<String>)> {
-    // Get PK columns in order
+    // Identity columns in order: PK (with relreplident='d') or
+    // the index used by REPLICA IDENTITY USING INDEX (relreplident='i').
+    // Mirrors the orchestrator's logic so JOIN keys match CDC ORDER BY.
     let pk_rows = pg.query(&format!(
         "SELECT a.attname \
-         FROM pg_index i \
+         FROM pg_class c \
+         JOIN pg_index i ON i.indrelid = c.oid \
          JOIN pg_attribute a ON a.attrelid = i.indrelid AND a.attnum = ANY(i.indkey) \
-         WHERE i.indrelid = '{}.{}'::regclass AND i.indisprimary \
+         WHERE c.oid = '{}.{}'::regclass \
+           AND ((c.relreplident = 'd' AND i.indisprimary) OR \
+                (c.relreplident = 'i' AND i.indexrelid = c.relrepidentindex)) \
          ORDER BY array_position(i.indkey, a.attnum)",
         schema, table
     ))?;
     let pk_names: Vec<String> = pk_rows.iter().map(|r| r[0].clone()).collect();
 
     if pk_names.is_empty() {
-        bail!("Table {}.{} has no primary key", schema, table);
+        bail!(
+            "Table {}.{} has no usable replica identity key \
+             (no PK and no REPLICA IDENTITY USING INDEX)",
+            schema, table
+        );
     }
 
     // Get all columns with types and nullability
