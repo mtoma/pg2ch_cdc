@@ -116,6 +116,7 @@ fn process_message(
     batches: &mut HashMap<String, CdcBatch>,
     expected_oids: &HashMap<String, u32>,
     stale_rel_ids: &mut HashSet<u32>,
+    skipped_counts: &mut HashMap<String, u64>,
 ) -> Result<()> {
     match msg {
         PgoutputMessage::Relation(rel) => {
@@ -181,7 +182,7 @@ fn process_message(
                 batch.add_insert(row);
                 debug!("INSERT into {}: {} values", table_name, values.len());
             } else {
-                warn!("INSERT for table '{}' which has no batch — skipping", table_name);
+                *skipped_counts.entry(table_name.clone()).or_insert(0) += 1;
             }
         }
         PgoutputMessage::Update {
@@ -210,7 +211,7 @@ fn process_message(
                 batch.add_update(row);
                 debug!("UPDATE {}: {} values", table_name, new_values.len());
             } else {
-                warn!("UPDATE for table '{}' which has no batch — skipping", table_name);
+                *skipped_counts.entry(table_name.clone()).or_insert(0) += 1;
             }
         }
         PgoutputMessage::Delete {
@@ -237,7 +238,7 @@ fn process_message(
                 batch.add_delete(row);
                 debug!("DELETE from {}", table_name);
             } else {
-                warn!("DELETE for table '{}' which has no batch — skipping", table_name);
+                *skipped_counts.entry(table_name.clone()).or_insert(0) += 1;
             }
         }
         PgoutputMessage::Begin { .. } | PgoutputMessage::Commit => {}
@@ -372,6 +373,11 @@ pub fn drain_cdc(cfg: &CdcConfig) -> Result<u64> {
 
     let mut stale_rel_ids: HashSet<u32> = HashSet::new();
 
+    // Count messages received for tables that are in the publication but
+    // not in our mirror config. Logged in aggregate via the periodic CDC
+    // progress line instead of one warn! per row.
+    let mut skipped_counts: HashMap<String, u64> = HashMap::new();
+
     info!("Prepared {} table batches for CDC", batches.len());
 
     // ── 3. Connect replication and start streaming ──────────────────────
@@ -460,7 +466,7 @@ pub fn drain_cdc(cfg: &CdcConfig) -> Result<u64> {
 
                     match decode_pgoutput(payload) {
                         Some(msg) => {
-                            process_message(msg, &mut relations, &mut rel_to_table, &mut batches, &expected_oids, &mut stale_rel_ids)?;
+                            process_message(msg, &mut relations, &mut rel_to_table, &mut batches, &expected_oids, &mut stale_rel_ids, &mut skipped_counts)?;
                         }
                         None => {
                             if !payload.is_empty() {
@@ -668,6 +674,20 @@ pub fn drain_cdc(cfg: &CdcConfig) -> Result<u64> {
                 total_ins, total_upd, total_del,
                 state_info
             );
+
+            // Aggregate summary of WAL messages received for tables in the
+            // publication but not in our mirror config — printed once per
+            // progress tick instead of one log per row.
+            if !skipped_counts.is_empty() {
+                let mut entries: Vec<(&String, &u64)> = skipped_counts.iter().collect();
+                entries.sort_by(|a, b| b.1.cmp(a.1));
+                let summary: Vec<String> = entries.iter()
+                    .map(|(t, n)| format!("{}={}", t, n))
+                    .collect();
+                let total: u64 = skipped_counts.values().sum();
+                info!("Skipped (not in config): {} total — {}", total, summary.join(", "));
+            }
+
             last_progress = Instant::now();
         }
 
