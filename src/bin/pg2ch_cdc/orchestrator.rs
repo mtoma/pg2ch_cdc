@@ -195,6 +195,7 @@ pub fn run_mirror(config: &MirrorConfig) -> Result<()> {
         None,
         IncompleteLoad,
         ReAdded,
+        SchemaDrift,
     }
 
     struct TableInfo {
@@ -273,6 +274,44 @@ pub fn run_mirror(config: &MirrorConfig) -> Result<()> {
             reload_reason = ReloadReason::ReAdded;
         }
 
+        // Schema drift: CH and PG data-column lists no longer match.
+        // Compare column NAMES in order (lightweight check, runs for every
+        // existing CH table). On mismatch, schedule a reload — the existing
+        // create + truncate loop below will DROP+CREATE with the current PG
+        // schema and the loader will repopulate from postgresql().
+        if ch_table_exists && reload_reason == ReloadReason::None {
+            let (ch_db, ch_tbl) = ch_table.split_once('.').unwrap_or(("default", &ch_table));
+            let ch_cols_raw = ch.query(&format!(
+                "SELECT name FROM system.columns \
+                 WHERE database='{}' AND table='{}' AND name NOT LIKE '_pg2ch_%' \
+                 ORDER BY position FORMAT TabSeparated",
+                ch_db, ch_tbl
+            ))?;
+            let ch_names: Vec<String> = ch_cols_raw.lines()
+                .filter(|l| !l.is_empty())
+                .map(|s| s.to_string())
+                .collect();
+
+            let pg_cols_raw = pg.query(&format!(
+                "SELECT a.attname FROM pg_attribute a \
+                 JOIN pg_class c ON c.oid = a.attrelid \
+                 JOIN pg_namespace n ON n.oid = c.relnamespace \
+                 WHERE n.nspname = '{}' AND c.relname = '{}' \
+                   AND a.attnum > 0 AND NOT a.attisdropped \
+                 ORDER BY a.attnum",
+                src.schema, table
+            ))?;
+            let pg_names: Vec<String> = pg_cols_raw.iter().map(|r| r[0].clone()).collect();
+
+            if ch_names != pg_names {
+                warn!(
+                    "Schema drift on {}: CH columns {:?} differ from PG {:?} — scheduling reload",
+                    table, ch_names, pg_names
+                );
+                reload_reason = ReloadReason::SchemaDrift;
+            }
+        }
+
         table_infos.push(TableInfo {
             table: table.clone(),
             pk_cols: pk_cols.clone(),
@@ -299,6 +338,7 @@ pub fn run_mirror(config: &MirrorConfig) -> Result<()> {
             let reason = match ti.reload_reason {
                 ReloadReason::IncompleteLoad => "RELOAD (incomplete load)",
                 ReloadReason::ReAdded => "RELOAD (re-added)",
+                ReloadReason::SchemaDrift => "RELOAD (schema drift)",
                 ReloadReason::None => unreachable!(),
             };
             (reason, "STALE".to_string())
