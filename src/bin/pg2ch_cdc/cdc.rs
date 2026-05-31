@@ -443,6 +443,17 @@ pub fn drain_cdc(cfg: &CdcConfig) -> Result<u64> {
     let mut last_progress = Instant::now();
     let mut last_feedback = Instant::now();
     let cdc_start = Instant::now();
+
+    // ETA tracking: only sample LSN progress once we're past replay.
+    // Replay scans the WAL at ~10 GB/min (much faster than CDC), so its
+    // rate is meaningless for projecting CDC-phase completion.
+    // Within the CDC phase, use a sliding window — CDC throughput is
+    // bursty (decoder buffers large transactions then releases in bursts),
+    // so a moving window adapts better than a cumulative average.
+    let cdc_eta_window = Duration::from_secs(300); // 5 minutes
+    let mut cdc_lsn_samples: std::collections::VecDeque<(Instant, u64)>
+        = std::collections::VecDeque::new();
+
     let _reached_target;
 
     loop {
@@ -616,18 +627,36 @@ pub fn drain_cdc(cfg: &CdcConfig) -> Result<u64> {
             // Throughput
             let msgs_per_sec = if elapsed > 0 { total_wal_msgs as f64 / elapsed as f64 } else { 0.0 };
 
-            // ETA: based on the walsender's LSN advance rate from restart_lsn.
-            // This counts both replay (PG re-decoding old WAL) and CDC (sending
-            // changes to us) since PG's bottleneck is consistently WAL scan
-            // throughput. Becomes accurate once a few minutes of progress accrue.
-            let total_lsn_distance = target_lsn.saturating_sub(restart_lsn);
-            let lsn_progress = walsender_sent.saturating_sub(restart_lsn).min(total_lsn_distance);
-            let eta_str = if lsn_progress > 0 && elapsed > 30 && total_lsn_distance > 0 {
-                let rate = lsn_progress as f64 / elapsed as f64;
-                let remaining = total_lsn_distance.saturating_sub(lsn_progress) as f64;
-                if rate > 0.0 {
+            // ETA: only meaningful in CDC phase (replay rate is unrelated to
+            // CDC consumption rate). Use a moving window over recent samples
+            // so the estimate adapts to bursts and stalls instead of being
+            // dragged by stale long-run averages.
+            let now = Instant::now();
+            if walsender_sent > confirmed_lsn {
+                let sample_lsn = walsender_sent.min(target_lsn);
+                cdc_lsn_samples.push_back((now, sample_lsn));
+                while let Some((t, _)) = cdc_lsn_samples.front() {
+                    if now.duration_since(*t) > cdc_eta_window {
+                        cdc_lsn_samples.pop_front();
+                    } else {
+                        break;
+                    }
+                }
+            }
+
+            let eta_str = if walsender_sent > confirmed_lsn && cdc_lsn_samples.len() >= 2 {
+                let (t_old, lsn_old) = cdc_lsn_samples.front().copied().unwrap();
+                let (t_new, lsn_new) = cdc_lsn_samples.back().copied().unwrap();
+                let span = t_new.duration_since(t_old).as_secs_f64();
+                let progressed = lsn_new.saturating_sub(lsn_old) as f64;
+                let remaining = target_lsn.saturating_sub(lsn_new) as f64;
+                if span >= 30.0 && progressed > 0.0 && remaining > 0.0 {
+                    let rate = progressed / span;
                     let eta_secs = (remaining / rate) as u64;
                     format!(", ETA {}", format_duration(eta_secs))
+                } else if span >= 30.0 && progressed == 0.0 && remaining > 0.0 {
+                    // No progress in the whole window — be honest, don't guess.
+                    ", ETA stalled".to_string()
                 } else {
                     String::new()
                 }
