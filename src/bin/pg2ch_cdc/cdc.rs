@@ -65,6 +65,18 @@ fn format_lsn(lsn: u64) -> String {
     format!("{:X}/{:X}", lsn >> 32, lsn & 0xFFFFFFFF)
 }
 
+fn format_duration(secs: u64) -> String {
+    if secs >= 86_400 {
+        format!("{}d{:02}h", secs / 86_400, (secs % 86_400) / 3600)
+    } else if secs >= 3600 {
+        format!("{}h{:02}m", secs / 3600, (secs % 3600) / 60)
+    } else if secs >= 60 {
+        format!("{}m{:02}s", secs / 60, secs % 60)
+    } else {
+        format!("{}s", secs)
+    }
+}
+
 /// Parse TRUNCATE message to extract relation IDs.
 /// Format: u32 n_relations, u8 options, then n_relations × u32 rel_id.
 fn parse_truncate_rel_ids(data: &[u8]) -> Vec<u32> {
@@ -599,16 +611,29 @@ pub fn drain_cdc(cfg: &CdcConfig) -> Result<u64> {
             let walsender_sent = walsender_lsn.unwrap_or(0);
 
             let elapsed = cdc_start.elapsed().as_secs();
-            let elapsed_str = if elapsed >= 3600 {
-                format!("{}h{:02}m", elapsed / 3600, (elapsed % 3600) / 60)
-            } else if elapsed >= 60 {
-                format!("{}m{:02}s", elapsed / 60, elapsed % 60)
-            } else {
-                format!("{}s", elapsed)
-            };
+            let elapsed_str = format_duration(elapsed);
 
             // Throughput
             let msgs_per_sec = if elapsed > 0 { total_wal_msgs as f64 / elapsed as f64 } else { 0.0 };
+
+            // ETA: based on the walsender's LSN advance rate from restart_lsn.
+            // This counts both replay (PG re-decoding old WAL) and CDC (sending
+            // changes to us) since PG's bottleneck is consistently WAL scan
+            // throughput. Becomes accurate once a few minutes of progress accrue.
+            let total_lsn_distance = target_lsn.saturating_sub(restart_lsn);
+            let lsn_progress = walsender_sent.saturating_sub(restart_lsn).min(total_lsn_distance);
+            let eta_str = if lsn_progress > 0 && elapsed > 30 && total_lsn_distance > 0 {
+                let rate = lsn_progress as f64 / elapsed as f64;
+                let remaining = total_lsn_distance.saturating_sub(lsn_progress) as f64;
+                if rate > 0.0 {
+                    let eta_secs = (remaining / rate) as u64;
+                    format!(", ETA {}", format_duration(eta_secs))
+                } else {
+                    String::new()
+                }
+            } else {
+                String::new()
+            };
 
             // Two-phase progress:
             // Phase 1 (replay): PG re-decodes from restart_lsn to confirmed_lsn — no data for us
@@ -667,12 +692,13 @@ pub fn drain_cdc(cfg: &CdcConfig) -> Result<u64> {
             };
 
             info!(
-                "CDC [{elapsed_str}] {} — {:.1}k msgs ({:.1}k/s, {}I/{}U/{}D){}",
+                "CDC [{elapsed_str}] {} — {:.1}k msgs ({:.1}k/s, {}I/{}U/{}D){}{}",
                 progress_str,
                 total_wal_msgs as f64 / 1000.0,
                 msgs_per_sec / 1000.0,
                 total_ins, total_upd, total_del,
-                state_info
+                state_info,
+                eta_str
             );
 
             // Aggregate summary of WAL messages received for tables in the
