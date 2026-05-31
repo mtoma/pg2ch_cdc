@@ -54,8 +54,8 @@ destination:
   password: secret
 
 settings:
-  batch_size: 1000           # CDC batch size before flush
-  flush_interval_secs: 5     # max seconds between CDC flushes
+  batch_size: 100000         # CDC rows per HTTP POST to ClickHouse before flush
+  flush_interval_secs: 30    # max seconds a batch can sit before flush (must be < wal_sender_timeout)
   parallel_loads: 2          # concurrent initial load threads
   binary: false              # pgoutput binary mode (PG 14+)
   ch_timeout_secs: 21600     # HTTP timeout for long-running loads

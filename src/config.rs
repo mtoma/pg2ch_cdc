@@ -64,8 +64,8 @@ impl Default for Settings {
 
 fn default_pg_port() -> u16 { 5432 }
 fn default_ch_port() -> u16 { 8123 }
-fn default_batch_size() -> usize { 1000 }
-fn default_flush_interval() -> u64 { 5 }
+fn default_batch_size() -> usize { 100_000 }
+fn default_flush_interval() -> u64 { 30 }
 fn default_parallel_loads() -> usize { 4 }
 fn default_ch_timeout() -> u64 { 3600 }
 
