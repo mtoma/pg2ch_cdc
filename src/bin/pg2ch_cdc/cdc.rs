@@ -454,6 +454,12 @@ pub fn drain_cdc(cfg: &CdcConfig) -> Result<u64> {
     let mut cdc_lsn_samples: std::collections::VecDeque<(Instant, u64)>
         = std::collections::VecDeque::new();
 
+    // Full history of windowed rates (one per progress tick once the
+    // 5-min window is populated). Used to compute optimistic/pessimistic
+    // ETA bounds via percentiles (p90 → fast, p10 → slow) applied to the
+    // CURRENT remaining distance.
+    let mut cdc_rate_history: Vec<f64> = Vec::new();
+
     let _reached_target;
 
     loop {
@@ -653,7 +659,41 @@ pub fn drain_cdc(cfg: &CdcConfig) -> Result<u64> {
                 if span >= 30.0 && progressed > 0.0 && remaining > 0.0 {
                     let rate = progressed / span;
                     let eta_secs = (remaining / rate) as u64;
-                    format!(", ETA {}", format_duration(eta_secs))
+
+                    // Record this windowed rate in history once the window
+                    // is at least 90% full (so early-startup partial windows
+                    // don't pollute the distribution).
+                    if span >= cdc_eta_window.as_secs_f64() * 0.9 {
+                        cdc_rate_history.push(rate);
+                    }
+
+                    // Optimistic / pessimistic bounds from historical
+                    // percentiles of windowed rates, applied to the current
+                    // remaining distance. Need enough samples for percentiles
+                    // to be meaningful.
+                    let bounds_str = if cdc_rate_history.len() >= 10 {
+                        let mut sorted = cdc_rate_history.clone();
+                        sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+                        let n = sorted.len();
+                        let p10_idx = n / 10;
+                        let p90_idx = (n * 9 / 10).min(n - 1);
+                        let p10_rate = sorted[p10_idx];   // slow rate → pessimistic ETA
+                        let p90_rate = sorted[p90_idx];   // fast rate → optimistic ETA
+                        let pess = if p10_rate > 0.0 {
+                            format_duration((remaining / p10_rate) as u64)
+                        } else {
+                            "∞".to_string()
+                        };
+                        let opt = if p90_rate > 0.0 {
+                            format_duration((remaining / p90_rate) as u64)
+                        } else {
+                            "?".to_string()
+                        };
+                        format!(" (best {}, worst {})", opt, pess)
+                    } else {
+                        String::new()
+                    };
+                    format!(", ETA {}{}", format_duration(eta_secs), bounds_str)
                 } else if span >= 30.0 && progressed == 0.0 && remaining > 0.0 {
                     // No progress in the whole window — be honest, don't guess.
                     ", ETA stalled".to_string()
