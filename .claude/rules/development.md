@@ -35,34 +35,47 @@ This tool is an **rsync for PostgreSQL → ClickHouse**. Every design decision f
 
 ## Building
 
-bindgen needs the libpq headers; the include path is distro-dependent.
+Requires a Rust toolchain, clang/libclang (for bindgen), and the PostgreSQL
+client development headers.
+
+bindgen must be pointed at the directory containing `libpq-fe.h`, and that
+path varies by platform. If `pg_config` is on PATH it will tell you:
 
 ```bash
-export PATH="$HOME/.cargo/bin:$PATH"
-
-# Debian/Ubuntu (incl. prod-l-data02)
-BINDGEN_EXTRA_CLANG_ARGS="-I/usr/include/postgresql" cargo build --release
-
-# RHEL/Fedora/openSUSE
-BINDGEN_EXTRA_CLANG_ARGS="-I/usr/include/pgsql" cargo build --release
+BINDGEN_EXTRA_CLANG_ARGS="-I$(pg_config --includedir)" cargo build --release
 ```
+
+`pg_config` is not shipped by every distribution's libpq package, so fall back
+to the conventional location:
+
+| Platform | `libpq-fe.h` location | Dev package |
+| --- | --- | --- |
+| Debian, Ubuntu | `/usr/include/postgresql` | `libpq-dev`, `libclang-dev` |
+| RHEL, Fedora | `/usr/include/pgsql` | `libpq-devel`, `clang-devel` |
+| openSUSE | `/usr/include/pgsql` | `postgresql-devel`, `clang-devel` |
+| Arch | `/usr/include` | `postgresql-libs`, `clang` |
+| macOS (Homebrew) | `$(brew --prefix libpq)/include` | `libpq`, `llvm` |
+
+```bash
+BINDGEN_EXTRA_CLANG_ARGS="-I/usr/include/postgresql" cargo build --release
+```
+
+If bindgen fails with `'libpq-fe.h' file not found`, the include path is
+wrong — locate the header (`find /usr/include -name libpq-fe.h`) and pass its
+directory.
 
 ## Deploying
 
-Build on the target host. The binary links against the build host's glibc, so
-a build from a rolling-release workstation (glibc 2.42) will not load on
-prod-l-data02 (Debian 12, glibc 2.36). Never scp a binary.
+Build on the machine you deploy to, or on one whose glibc is no newer. The
+binary links dynamically against the build host's libc, so a build from a
+rolling-release workstation will fail to load on a stable-release server with
+an older glibc. Pull the source and rebuild in place rather than copying a
+binary between machines.
 
-```bash
-ssh vcpapp@prod-l-data02
-cd /DATA_SSD/TOOLS/pg2ch_cdc && git pull
-export PATH="$HOME/.cargo/bin:$PATH"
-BINDGEN_EXTRA_CLANG_ARGS="-I/usr/include/postgresql" cargo build --release
-```
-
-`DL_VCP_CDC` invokes `target/release/pg2ch_cdc` directly and fires every 5
-minutes. Rebuilding mid-run is safe — cargo renames a new inode into place, so
-an in-flight process keeps running the old binary until it exits.
+Rebuilding while an invocation is in flight is safe: cargo renames a freshly
+written file into place, so a running process keeps executing the old inode
+until it exits and the next invocation picks up the new binary. No need to
+pause the scheduler.
 
 ## Known limitations
 

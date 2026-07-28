@@ -22,9 +22,13 @@
 //! Reporting `last_decoded_lsn` would make the pipeline at-most-once: a crash
 //! between the feedback message and the ClickHouse insert permanently skips the
 //! un-flushed window, because the next run resumes from the advanced pointer and
-//! that WAL is never re-read. This is not hypothetical — it silently dropped
-//! 37,156 rows across 11 `ciq` tables on 2026-07-28 when a ClickHouse insert hit
-//! `connection closed before message completed` mid-batch.
+//! that WAL is never re-read. This is not hypothetical. An earlier revision
+//! acknowledged on decode and lost tens of thousands of rows across a dozen
+//! tables when a ClickHouse insert died mid-batch with `connection closed before
+//! message completed`: the process exited non-zero as designed, but had already
+//! confirmed gigabytes of WAL it never wrote. Nothing detected it — from the
+//! slot's perspective the mirror was caught up, so every later run reported
+//! being in sync. Only an external row-count diff caught the gap.
 //!
 //! Replaying a window is safe: every target is
 //! `ReplacingMergeTree(_pg2ch_version, _pg2ch_is_deleted)`, `version_counter` is
