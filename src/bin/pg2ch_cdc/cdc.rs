@@ -4,6 +4,33 @@
 //! as our target. We stream WAL until we reach that LSN, apply all changes to
 //! the correct ClickHouse tables, then confirm the position and exit.
 //! Any WAL accumulated during processing is left for the next run.
+//!
+//! ## Durability contract (at-least-once)
+//!
+//! This process keeps no local state. The resume point after a crash is the
+//! replication slot's `confirmed_flush_lsn` in Postgres — so *that pointer is
+//! our state*, and advancing it is a durability claim, not a progress report.
+//!
+//! Two watermarks are tracked, and the distinction is load-bearing:
+//!
+//! - `last_decoded_lsn` — advanced the moment a WAL message is decoded into an
+//!   in-memory batch. Used for progress display and loop termination only.
+//!   **Never** sent to Postgres as written/flushed/applied.
+//! - `last_durable_lsn` — advanced only after every batch has been successfully
+//!   flushed to ClickHouse. This is the only value ever reported to Postgres.
+//!
+//! Reporting `last_decoded_lsn` would make the pipeline at-most-once: a crash
+//! between the feedback message and the ClickHouse insert permanently skips the
+//! un-flushed window, because the next run resumes from the advanced pointer and
+//! that WAL is never re-read. This is not hypothetical — it silently dropped
+//! 37,156 rows across 11 `ciq` tables on 2026-07-28 when a ClickHouse insert hit
+//! `connection closed before message completed` mid-batch.
+//!
+//! Replaying a window is safe: every target is
+//! `ReplacingMergeTree(_pg2ch_version, _pg2ch_is_deleted)`, `version_counter` is
+//! seeded from wall-clock nanoseconds so a later run always outranks an earlier
+//! one, and readers (including pg2ch_diff) use `FINAL`. Duplicates collapse;
+//! gaps do not heal. Always err toward replay.
 
 use anyhow::{bail, Context, Result};
 use std::collections::{HashMap, HashSet};
@@ -17,6 +44,11 @@ use pg2ch_cdc::types::{build_delete_row, tuple_to_strings};
 
 // ── Standby status feedback ─────────────────────────────────────────────
 
+/// Build a standby status update ('r' message).
+///
+/// The `flushed` field is what advances the slot's `confirmed_flush_lsn` and
+/// permits Postgres to recycle WAL. Only ever pass `last_durable_lsn` here —
+/// see the module docs on the at-least-once contract.
 fn build_standby_status(lsn: u64) -> Vec<u8> {
     const PG_EPOCH_OFFSET: u64 = 946_684_800;
     let now_us = SystemTime::now()
@@ -435,13 +467,17 @@ pub fn drain_cdc(cfg: &CdcConfig) -> Result<u64> {
     // ── 4. Read WAL until we reach target_lsn ───────────────────────────
     let mut relations: HashMap<u32, RelationInfo> = HashMap::new();
     let mut rel_to_table: HashMap<u32, String> = HashMap::new();
-    // Start with the confirmed position — used for keepalive replies before
-    // we've processed any WAL. This tells PG "I'm alive" without advancing the slot.
-    let mut last_processed_lsn: u64 = confirmed_lsn;
+    // Decoded, not necessarily durable: advanced as soon as a WAL message is
+    // routed into an in-memory batch. Drives progress display and termination.
+    let mut last_decoded_lsn: u64 = confirmed_lsn;
+    // Durable in ClickHouse: the ONLY watermark ever reported to Postgres.
+    // Advanced solely by the checkpoint below, after every batch has flushed.
+    let mut last_durable_lsn: u64 = confirmed_lsn;
     let mut last_server_wal_end: u64 = 0; // tracks PG's decoding progress from keepalives
     let mut total_wal_msgs: u64 = 0;
     let mut last_progress = Instant::now();
     let mut last_feedback = Instant::now();
+    let mut last_checkpoint = Instant::now();
     let cdc_start = Instant::now();
 
     // ETA tracking: only sample LSN progress once we're past replay.
@@ -490,7 +526,9 @@ pub fn drain_cdc(cfg: &CdcConfig) -> Result<u64> {
                     let wal_start = u64::from_be_bytes(raw[1..9].try_into().unwrap());
                     let wal_end = u64::from_be_bytes(raw[9..17].try_into().unwrap());
                     let payload = &raw[25..];
-                    last_processed_lsn = wal_end;
+                    // Decoded only — the rows this message produces land in an
+                    // in-memory batch. Durability is claimed at the checkpoint.
+                    last_decoded_lsn = wal_end;
                     total_wal_msgs += 1;
 
                     match decode_pgoutput(payload) {
@@ -559,23 +597,24 @@ pub fn drain_cdc(cfg: &CdcConfig) -> Result<u64> {
                     last_server_wal_end = server_wal_end;
                     let reply_requested = raw[17] != 0;
 
-                    // Reply with our last processed LSN (never the server's position)
-                    if reply_requested && last_processed_lsn > 0 {
-                        conn.put_copy_data(&build_standby_status(last_processed_lsn))
+                    // Reply with our durable LSN (never the server's position, and
+                    // never the decoded position — see the module docs).
+                    if reply_requested {
+                        conn.put_copy_data(&build_standby_status(last_durable_lsn))
                             .context("Failed to send standby status")?;
                         conn.flush().context("Failed to flush standby status")?;
                     }
 
                     // If the server's WAL end is at or past our target and it's sending
                     // keepalives (no more data to send), we've consumed everything up to target.
-                    // Update last_processed_lsn so the outer loop's termination check triggers.
+                    // Update last_decoded_lsn so the outer loop's termination check triggers.
                     if server_wal_end >= target_lsn {
                         info!(
                             "Server WAL end {} >= target {} — all relevant WAL delivered",
                             format_lsn(server_wal_end),
                             format_lsn(target_lsn)
                         );
-                        last_processed_lsn = target_lsn;
+                        last_decoded_lsn = target_lsn;
                         break;
                     }
                 }
@@ -585,22 +624,52 @@ pub fn drain_cdc(cfg: &CdcConfig) -> Result<u64> {
             }
         }
 
-        // Proactive standby status every 10 seconds — required to stay within
-        // wal_sender_timeout (default 60s). All CDC tools do this (Debezium, PeerDB,
-        // pglogrepl, pg_recvlogical). Without this, PG kills the connection during
-        // long WAL scans where most data is for other tables.
-        if last_feedback.elapsed() > Duration::from_secs(10) {
-            conn.put_copy_data(&build_standby_status(last_processed_lsn))
-                .context("Failed to send proactive standby status")?;
-            conn.flush().context("Failed to flush proactive standby status")?;
-            last_feedback = Instant::now();
-        }
-
-        // Flush any batch that's full or past its interval
+        // Opportunistic flush: drain any batch that's full or past its interval.
+        // Throughput optimisation only — it does NOT advance any watermark, since
+        // other batches may still hold rows decoded at a lower LSN.
         for batch in batches.values_mut() {
             if batch.should_flush() {
                 batch.flush(&ch)?;
             }
+        }
+
+        // ── Durability checkpoint ───────────────────────────────────────
+        // Drain EVERY batch, then — and only then — promote the durable
+        // watermark and report it to Postgres. The watermark is captured
+        // before the drain: rows decoded during/after it are not covered.
+        //
+        // Ordering is the whole point. Flush first, acknowledge second. If any
+        // flush fails we bail with `?` and never promote, so the next run
+        // replays this window from the last successfully checkpointed position.
+        if last_checkpoint.elapsed() > cfg.flush_interval {
+            let watermark = last_decoded_lsn;
+            for batch in batches.values_mut() {
+                batch.flush(&ch)?;
+            }
+            last_durable_lsn = watermark;
+
+            conn.put_copy_data(&build_standby_status(last_durable_lsn))
+                .context("Failed to send checkpoint standby status")?;
+            conn.flush().context("Failed to flush checkpoint standby status")?;
+            debug!("Checkpoint: durable through {}", format_lsn(last_durable_lsn));
+
+            last_feedback = Instant::now();
+            last_checkpoint = Instant::now();
+        }
+
+        // Liveness keepalive every 10 seconds — required to stay within
+        // wal_sender_timeout (default 60s). All CDC tools do this (Debezium, PeerDB,
+        // pglogrepl, pg_recvlogical). Without this, PG kills the connection during
+        // long WAL scans where most data is for other tables.
+        //
+        // This re-sends the unchanged durable watermark. PG accepts a repeated LSN
+        // as proof of life without advancing the slot — which is exactly right:
+        // we are alive, but nothing new is durable yet.
+        if last_feedback.elapsed() > Duration::from_secs(10) {
+            conn.put_copy_data(&build_standby_status(last_durable_lsn))
+                .context("Failed to send proactive standby status")?;
+            conn.flush().context("Failed to flush proactive standby status")?;
+            last_feedback = Instant::now();
         }
 
         // Progress logging every 10 seconds
@@ -731,12 +800,12 @@ pub fn drain_cdc(cfg: &CdcConfig) -> Result<u64> {
                 )
             } else {
                 // Phase 2: CDC processing
-                let effective_lsn = [walsender_lsn, Some(last_server_wal_end), Some(last_processed_lsn)]
+                let effective_lsn = [walsender_lsn, Some(last_server_wal_end), Some(last_decoded_lsn)]
                     .iter()
                     .filter_map(|x| *x)
                     .filter(|x| *x > 0)
                     .max()
-                    .unwrap_or(last_processed_lsn);
+                    .unwrap_or(last_decoded_lsn);
 
                 let cdc_pct = if target_lsn > confirmed_lsn && effective_lsn > confirmed_lsn {
                     ((effective_lsn - confirmed_lsn) as f64 / (target_lsn - confirmed_lsn) as f64 * 100.0).min(100.0)
@@ -786,8 +855,9 @@ pub fn drain_cdc(cfg: &CdcConfig) -> Result<u64> {
             last_progress = Instant::now();
         }
 
-        // Check termination: have we reached the target?
-        if last_processed_lsn >= target_lsn {
+        // Check termination: have we decoded up to the target? Durability is
+        // settled by the final flush + confirm below.
+        if last_decoded_lsn >= target_lsn {
             _reached_target = true;
             break;
         }
@@ -803,23 +873,27 @@ pub fn drain_cdc(cfg: &CdcConfig) -> Result<u64> {
     }
 
     // ── 5. Final flush all batches ──────────────────────────────────────
+    // Must complete before step 6. A failure here bails without confirming,
+    // leaving the slot where the last checkpoint put it so the next run replays.
     for batch in batches.values_mut() {
         batch.flush(&ch)?;
     }
 
-    // ── 6. Confirm the LSN we processed ─────────────────────────────────
-    let confirm_lsn = if last_processed_lsn > 0 {
-        last_processed_lsn
+    // Every decoded row is now durable in ClickHouse — promote the watermark.
+    last_durable_lsn = if last_decoded_lsn > 0 {
+        last_decoded_lsn
     } else {
         // We processed no WAL messages but the server scanned past our target
-        // (all WAL was for other tables). Confirm the target LSN.
+        // (all WAL was for other tables). Nothing to write, so the target is
+        // trivially durable.
         target_lsn
     };
 
-    conn.put_copy_data(&build_standby_status(confirm_lsn))
+    // ── 6. Confirm the LSN we made durable ──────────────────────────────
+    conn.put_copy_data(&build_standby_status(last_durable_lsn))
         .context("Failed to send final standby status")?;
     conn.flush().context("Failed to flush final standby status")?;
-    info!("Confirmed LSN: {}", format_lsn(confirm_lsn));
+    info!("Confirmed LSN: {}", format_lsn(last_durable_lsn));
 
     // ── 7. Summary ──────────────────────────────────────────────────────
     let total_applied: u64 = batches.values().map(|b| b.total_applied).sum();

@@ -35,10 +35,34 @@ This tool is an **rsync for PostgreSQL → ClickHouse**. Every design decision f
 
 ## Building
 
+bindgen needs the libpq headers; the include path is distro-dependent.
+
 ```bash
 export PATH="$HOME/.cargo/bin:$PATH"
+
+# Debian/Ubuntu (incl. prod-l-data02)
+BINDGEN_EXTRA_CLANG_ARGS="-I/usr/include/postgresql" cargo build --release
+
+# RHEL/Fedora/openSUSE
 BINDGEN_EXTRA_CLANG_ARGS="-I/usr/include/pgsql" cargo build --release
 ```
+
+## Deploying
+
+Build on the target host. The binary links against the build host's glibc, so
+a build from a rolling-release workstation (glibc 2.42) will not load on
+prod-l-data02 (Debian 12, glibc 2.36). Never scp a binary.
+
+```bash
+ssh vcpapp@prod-l-data02
+cd /DATA_SSD/TOOLS/pg2ch_cdc && git pull
+export PATH="$HOME/.cargo/bin:$PATH"
+BINDGEN_EXTRA_CLANG_ARGS="-I/usr/include/postgresql" cargo build --release
+```
+
+`DL_VCP_CDC` invokes `target/release/pg2ch_cdc` directly and fires every 5
+minutes. Rebuilding mid-run is safe — cargo renames a new inode into place, so
+an in-flight process keeps running the old binary until it exits.
 
 ## Known limitations
 
