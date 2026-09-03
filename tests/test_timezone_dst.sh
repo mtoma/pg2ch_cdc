@@ -142,20 +142,28 @@ echo "$TYPES" | grep -q "tz_ts.*DateTime64(6, 'UTC')" \
 echo "$TYPES" | grep -q "_pg2ch_synced_at.*DateTime64(9, 'UTC')" \
     || fail "_pg2ch_synced_at type does not state UTC: $TYPES"
 
-# Compare PG and CH row for row. Rendering CH with no timezone argument is
-# the point: it must return exactly what PostgreSQL holds.
+# Compare PG and CH row for row.
+#
+# naive_ts is compared with NO timezone argument on the CH side: that is the
+# point of the whole exercise — the column must hand back exactly the wall
+# clock PostgreSQL holds, whatever timezone it is stored in.
+#
+# tz_ts is an instant, so it is compared as its UTC rendering. Both sides must
+# format identically: CH toString() on a DateTime64(6) always emits 6 decimals,
+# and PG's `.US` pattern zero-pads to 6 — an earlier version compared epoch
+# seconds and failed only because one side trimmed the trailing zeros.
 compare_all() {
     local phase="$1"
     local pg_out ch_out
     pg_out=$($PSQL -At -F$'\t' -c "
         SELECT id,
                coalesce(to_char(naive_ts,'YYYY-MM-DD HH24:MI:SS.US'),'~NULL~'),
-               coalesce(trim(to_char(extract(epoch from tz_ts),'9999999999999.999999')),'~NULL~')
+               coalesce(to_char(tz_ts AT TIME ZONE 'UTC','YYYY-MM-DD HH24:MI:SS.US'),'~NULL~')
         FROM $SCHEMA.events ORDER BY id")
     ch_out=$(ch_query "
         SELECT id,
                ifNull(toString(naive_ts),'~NULL~'),
-               ifNull(trim(leading ' ' FROM toString(toDecimal64(toUnixTimestamp64Micro(tz_ts)/1000000.0, 6))),'~NULL~')
+               ifNull(toString(tz_ts, 'UTC'),'~NULL~')
         FROM $CH_DATABASE.events FINAL WHERE _pg2ch_is_deleted = 0
         ORDER BY id FORMAT TabSeparatedRaw")
 
