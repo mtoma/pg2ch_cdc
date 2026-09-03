@@ -29,9 +29,13 @@ jobs:
 
       - name: Start ClickHouse
         run: |
+          # TZ=Europe/Paris deliberately: an omitted DateTime timezone is
+          # resolved against the server default, so a UTC server hides every
+          # timezone bug this suite is meant to catch.
           docker run -d --name clickhouse --network host \
             -e CLICKHOUSE_DEFAULT_ACCESS_MANAGEMENT=1 \
             -e CLICKHOUSE_PASSWORD="" \
+            -e TZ=Europe/Paris \
             clickhouse/clickhouse-server:latest
           # Wait for CH to be ready
           for i in $(seq 1 30); do
@@ -52,6 +56,8 @@ jobs:
             echo "Waiting for ClickHouse... attempt $i"
             sleep 2
           done
+          # The timezone test is only meaningful on a DST-observing server.
+          curl -sf 'http://localhost:8123/?query=SELECT+serverTimeZone()' | grep -q 'Europe/Paris'
 
       - name: Install system dependencies
         run: sudo apt-get install -y libpq-dev clang
@@ -72,6 +78,9 @@ jobs:
 
       - name: Build
         run: cargo build --release
+
+      - name: Unit tests
+        run: cargo test --lib
 
       - name: Test basic replication
         env:
@@ -124,3 +133,16 @@ jobs:
           TEST_CH_USER: default
           TEST_CH_PASSWORD: ""
         run: bash tests/test_pk_update.sh
+
+      - name: Test timezone and DST handling
+        env:
+          TEST_PG_HOST: localhost
+          TEST_PG_PORT: "5432"
+          TEST_PG_USER: test
+          TEST_PG_PASSWORD: test
+          TEST_PG_DATABASE: test_db
+          TEST_CH_HOST: localhost
+          TEST_CH_PORT: "8123"
+          TEST_CH_USER: default
+          TEST_CH_PASSWORD: ""
+        run: bash tests/test_timezone_dst.sh

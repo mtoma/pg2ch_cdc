@@ -150,6 +150,8 @@ pub struct CdcConfig {
     pub flush_interval: Duration,
     pub binary: bool,
     pub ch_timeout_secs: u64,
+    /// Timezone naive PG timestamps are stored in (see MirrorConfig::timezone).
+    pub timezone: String,
     /// Pre-snapshotted target LSN (from before initial loads).
     /// If set, CDC uses this instead of querying pg_current_wal_flush_lsn().
     pub target_lsn: Option<String>,
@@ -344,7 +346,7 @@ pub fn drain_cdc(cfg: &CdcConfig) -> Result<u64> {
     // Keep pg alive — used for pg_stat_replication progress queries during CDC
 
     // ── 2. Create ChClient and per-table batches ────────────────────────
-    let ch = ChClient::new(&cfg.ch_host, cfg.ch_port, &cfg.ch_user, &cfg.ch_password, cfg.ch_timeout_secs);
+    let ch = ChClient::new(&cfg.ch_host, cfg.ch_port, &cfg.ch_user, &cfg.ch_password, cfg.ch_timeout_secs, &cfg.timezone);
 
     let mut batches: HashMap<String, CdcBatch> = HashMap::new();
     for (pg_table, ch_table) in &cfg.tables {

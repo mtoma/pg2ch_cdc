@@ -30,8 +30,17 @@ This tool is an **rsync for PostgreSQL → ClickHouse**. Every design decision f
 - Don't add async/tokio. The synchronous model is a deliberate choice.
 - Don't add abstractions for hypothetical future needs. Keep it concrete.
 - Don't change the `_pg2ch_*` column naming convention (synced_at, is_deleted, version).
+- Don't do timezone arithmetic in Rust. ClickHouse owns it — we set
+  `session_timezone` and forward timestamp text verbatim. Doing it here would
+  mean carrying a timezone database and keeping it in exact agreement with the
+  `postgresql()` initial-load path, which runs inside ClickHouse.
+- Don't give `timezone:` a default. An invisible default is the bug this
+  setting exists to prevent.
 - Don't change the publication/slot naming convention: `pg2ch_{mirror_name}`.
-- Test against the real servers (see CLAUDE.md for hostnames) — there's no test infrastructure.
+- Test against the real servers (see CLAUDE.md for hostnames), and run
+  `tests/*.sh` against containers. **ClickHouse must run on a DST-observing
+  timezone** (CI uses `TZ=Europe/Paris`) — on a UTC server every timezone bug
+  is invisible.
 
 ## Building
 

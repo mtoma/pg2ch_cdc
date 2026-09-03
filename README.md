@@ -37,6 +37,7 @@ Create a YAML config in `mirrors/`:
 
 ```yaml
 mirror_name: my_mirror
+timezone: UTC                # REQUIRED — see "Timestamps and timezones" below
 
 source:
   host: pg-host
@@ -94,8 +95,8 @@ Every target table is auto-created as a `ReplacingMergeTree` with three extra co
 
 ```sql
 CREATE TABLE my_table (
-    -- ... source columns (auto-mapped from PG types) ...
-    _pg2ch_synced_at DateTime64(9) DEFAULT now64(),
+    -- ... source columns (types chosen by ClickHouse, timezone pinned) ...
+    _pg2ch_synced_at DateTime64(9, 'UTC') DEFAULT now64(),
     _pg2ch_is_deleted UInt8 DEFAULT 0,
     _pg2ch_version UInt64 DEFAULT 0
 ) ENGINE = ReplacingMergeTree(_pg2ch_version, _pg2ch_is_deleted)
@@ -109,6 +110,64 @@ Query with deduplication:
 ```sql
 SELECT * FROM my_table FINAL WHERE _pg2ch_is_deleted = 0
 ```
+
+### Timestamps and timezones
+
+`timezone:` is **required** in every config. There is no default, on purpose.
+
+PostgreSQL has two timestamp types with different meanings, and ClickHouse has
+only one:
+
+| PostgreSQL | Meaning | Stored in ClickHouse as |
+|---|---|---|
+| `timestamp` | a wall clock, no timezone | that wall clock, read in `timezone:` |
+| `timestamptz` | an instant | the same instant, displayed in `timezone:` |
+
+Every ClickHouse `DateTime64` is an instant plus a display timezone, and
+`DESCRIBE TABLE postgresql(...)` never states one — so an unqualified column
+silently inherits the ClickHouse **server** timezone. That default is invisible
+from the config, differs between hosts, and changing it reinterprets every row
+already stored. pg2ch_cdc therefore requires you to state the timezone and
+writes it into the column type, so the convention travels with the data:
+
+```sql
+naive_ts Nullable(DateTime64(6, 'UTC'))
+```
+
+`SELECT toString(col)` then returns exactly what PostgreSQL holds, with no
+timezone argument needed.
+
+**Use UTC unless you have a concrete reason not to.** A timezone that observes
+DST is rejected at startup, because it cannot represent the data:
+
+- The hour a **spring-forward** skips does not exist. A PostgreSQL value inside
+  it has no corresponding instant, so it lands on the hour before — where real
+  data already lives. Two different source values then share one stored value
+  and can no longer be told apart.
+- The hour an **autumn fall-back** repeats occurs twice, so the stored instant
+  is ambiguous.
+
+Fixed-offset zones (`Asia/Kolkata`, `Etc/GMT+5`, …) are accepted if you need
+local wall clocks.
+
+A mirror that **already** holds data on a DST timezone can keep running by
+opting in explicitly:
+
+```yaml
+timezone: Europe/Paris
+timezone_allow_dst: true
+```
+
+This accepts the defect above rather than hiding it: every run prints a warning
+naming the exposure. It exists so an existing deployment is not forced into a
+full migration just to start up — not as a way to avoid choosing UTC for a new
+one.
+
+On an existing table, pg2ch_cdc compares the stored timezone against the
+config. It pins the type where they agree — a metadata-only change that rewrites
+no data — and refuses to run where they disagree, rather than writing two
+conventions into one column. The error message includes the `ALTER` statements
+to migrate deliberately.
 
 ### Consistency model
 
@@ -260,6 +319,7 @@ Diff configs live in `diffs/`. They reuse the same source/destination format as 
 
 ```yaml
 mirror_name: my_mirror
+timezone: UTC                # REQUIRED — must match the mirror config
 
 source:
   host: pg-host

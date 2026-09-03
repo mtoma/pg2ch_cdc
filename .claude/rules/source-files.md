@@ -3,13 +3,13 @@
 | File | Purpose |
 |------|---------|
 | `main.rs` | CLI (`--config`, `--plain`), tracing init, entry point |
-| `config.rs` | YAML config parsing (serde), publication/slot/table naming |
+| `config.rs` | YAML config parsing (serde), mandatory `timezone:` validation, publication/slot/table naming |
 | `orchestrator.rs` | Diff report, create tables, parallel initial loads with progress monitoring, snapshot LSN, partial load detection, drain CDC, post-CDC integrity check |
 | `cdc.rs` | Replication protocol: start slot, read WAL, multi-table message routing, drain to target LSN |
-| `clickhouse.rs` | HTTP client, CdcBatch accumulator, TSV escaping |
+| `clickhouse.rs` | HTTP client (pins `session_timezone` on every request), CdcBatch accumulator, TSV escaping, DateTime type-string timezone pinning |
 | `pg.rs` | Thin libpq wrapper: `execute(sql)` and `query(sql) → Vec<Vec<String>>` |
 | `pgoutput.rs` | Binary pgoutput protocol parser (Relation/Insert/Update/Delete/Begin/Commit) |
-| `types.rs` | PG→CH type conversion: text mode, binary wire format, numeric, timestamptz |
+| `types.rs` | PG→CH type conversion: text mode, binary wire format, numeric. Timestamps are forwarded verbatim — ClickHouse resolves them |
 
 ## pg2ch_diff (validation tool)
 
@@ -26,6 +26,7 @@ One file per mirror in `mirrors/`. Example:
 
 ```yaml
 mirror_name: cstat     # used for publication/slot naming: pg2ch_cstat
+timezone: UTC          # REQUIRED — timezone timestamps are stored in
 
 source:
   host: pg-host

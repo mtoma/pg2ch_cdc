@@ -14,7 +14,7 @@ PostgreSQL (pgoutput WAL) ──► pg2ch_cdc (libpq FFI) ──► ClickHouse (
 Auto-created by the orchestrator. Every table gets three extra columns:
 
 ```sql
-_pg2ch_synced_at DateTime64(9) DEFAULT now64()
+_pg2ch_synced_at DateTime64(9, '<timezone>') DEFAULT now64()
 _pg2ch_is_deleted UInt8 DEFAULT 0
 _pg2ch_version UInt64 DEFAULT 0
 ```
@@ -27,9 +27,17 @@ To query with correct deduplication: `SELECT ... FROM table FINAL WHERE _pg2ch_i
 
 CH types are determined by ClickHouse's own `postgresql()` table function via `DESCRIBE TABLE postgresql(...)`. This ensures the mapping is always consistent with what CH would produce natively. Nullable PG columns become `Nullable()` in CH. PK columns are never Nullable.
 
+The **one** post-processing step is timezone pinning: `DESCRIBE` always returns
+a bare `DateTime64(6)`, which silently binds the column to the ClickHouse
+server default. `clickhouse::pin_datetime_timezone` writes the config's
+`timezone:` into whatever DateTime type CH chose. This is not a type mapping —
+CH still decides Int32 vs Decimal vs String — and there is no mapping table to
+maintain. See `timezones.md`.
+
 CDC type conversions handled in `types.rs`:
 - `bool` → `UInt8` (t/f → 1/0)
-- `timestamptz` → `DateTime64(6)` (converted to UTC, offset stripped)
+- `timestamp` / `timestamptz` → forwarded verbatim; ClickHouse resolves them
+  (`session_timezone` + `date_time_input_format=best_effort`). See `timezones.md`.
 - `numeric` → `Decimal` (binary base-10000 decoder)
 - Binary mode: int2/4/8, float4/8, date, timestamp, uuid all decoded from PG wire format
 

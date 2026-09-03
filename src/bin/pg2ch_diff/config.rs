@@ -9,6 +9,12 @@ use std::path::Path;
 #[derive(Debug, Deserialize)]
 pub struct DiffConfig {
     pub mirror_name: String,
+    /// Timezone the mirror stores timestamps in. **Mandatory**, and must match
+    /// the CDC mirror config: the diff snapshots PostgreSQL into ClickHouse via
+    /// postgresql(), so a wrong value here makes the comparison itself resolve
+    /// naive timestamps differently from the mirror and report false diffs.
+    #[serde(default)]
+    pub timezone: String,
     pub source: pg2ch_cdc::config::SourceConfig,
     pub destination: pg2ch_cdc::config::DestinationConfig,
     /// CH database for temporary snapshot tables (defaults to destination database)
@@ -68,6 +74,8 @@ impl DiffConfig {
         if config.tables.is_empty() {
             anyhow::bail!("No tables specified in diff config: {}", path.display());
         }
+        pg2ch_cdc::config::validate_timezone(&config.timezone)
+            .with_context(|| format!("In diff config: {}", path.display()))?;
         Ok(config)
     }
 

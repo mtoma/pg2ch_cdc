@@ -19,7 +19,9 @@ pub fn default_for_oid(oid: u32) -> &'static str {
         25 | 1043 => "",
         1082 => "1970-01-01",
         1114 => "1970-01-01 00:00:00",
-        1184 => "1970-01-01 00:00:00",
+        // timestamptz is an instant: state the offset so it cannot be
+        // reinterpreted against the mirror's configured timezone.
+        1184 => "1970-01-01 00:00:00+00:00",
         2950 => "00000000-0000-0000-0000-000000000000",
         _ => "",
     }
@@ -39,9 +41,9 @@ pub fn build_delete_row(key_values: &[TupleData], rel: &RelationInfo) -> Vec<Str
         if col_idx < key_values.len() {
             let oid = rel.columns.get(col_idx).map(|c| c.type_oid).unwrap_or(0);
             let val = match &key_values[col_idx] {
-                TupleData::Text(s) => {
-                    if oid == 1184 { timestamptz_to_utc(s) } else { s.clone() }
-                }
+                // Text values pass through untouched — including timestamptz,
+                // whose `+01`-style offset ClickHouse resolves itself.
+                TupleData::Text(s) => s.clone(),
                 TupleData::Binary(data) => decode_binary_value(oid, data),
                 TupleData::Null | TupleData::Unchanged => "\\N".to_string(),
             };
@@ -61,49 +63,24 @@ pub fn build_delete_row(key_values: &[TupleData], rel: &RelationInfo) -> Vec<Str
         .collect()
 }
 
-// ── Timestamptz conversion ──────────────────────────────────────────────
-
-/// Convert a PostgreSQL timestamptz string to UTC and strip the offset.
-/// PostgreSQL sends "2026-03-11 15:32:14.085517+01" — we parse it,
-/// convert to UTC, and return "2026-03-11 14:32:14.085517".
-pub fn timestamptz_to_utc(s: &str) -> String {
-    let normalized = normalize_pg_offset(s);
-    match chrono::DateTime::parse_from_str(&normalized, "%Y-%m-%d %H:%M:%S%.f%:z") {
-        Ok(dt) => {
-            let utc = dt.with_timezone(&chrono::Utc);
-            utc.format("%Y-%m-%d %H:%M:%S%.6f").to_string()
-        }
-        Err(_) => {
-            warn!("Failed to parse timestamptz '{}', passing through as-is", s);
-            s.to_string()
-        }
-    }
-}
-
-/// Normalize PostgreSQL timezone offsets to chrono-compatible format.
-/// "2026-03-11 10:30:00+01" → "2026-03-11 10:30:00+01:00"
-/// "2026-03-11 10:30:00+05:30" stays as-is
-fn normalize_pg_offset(s: &str) -> String {
-    let bytes = s.as_bytes();
-    let mut tz_pos = None;
-    for i in (1..bytes.len()).rev() {
-        if (bytes[i] == b'+' || bytes[i] == b'-') && bytes[i - 1].is_ascii_digit() {
-            tz_pos = Some(i);
-            break;
-        }
-    }
-    let Some(pos) = tz_pos else {
-        return s.to_string();
-    };
-    let offset_part = &s[pos..];
-    if offset_part.len() == 3
-        && offset_part.as_bytes()[1].is_ascii_digit()
-        && offset_part.as_bytes()[2].is_ascii_digit()
-    {
-        return format!("{}:00", s);
-    }
-    s.to_string()
-}
+// ── Timestamp handling ──────────────────────────────────────────────────
+//
+// Neither timestamp type is converted here, and that is deliberate.
+//
+// `timestamp` (OID 1114) is a naive wall clock. We forward it verbatim and
+// ClickHouse resolves it against `session_timezone`, which the client pins to
+// the mirror's configured timezone. Doing the arithmetic here instead would
+// mean reimplementing a timezone database, and would still have to agree
+// exactly with what the `postgresql()` initial-load path does inside
+// ClickHouse — a duplication with no upside.
+//
+// `timestamptz` (OID 1184) is an instant. PostgreSQL renders it with its
+// offset ("2026-03-11 15:32:14.085517+01"), and with
+// `date_time_input_format=best_effort` ClickHouse honours that offset and
+// stores the exact instant. Converting to UTC and dropping the offset — as
+// this code used to do — produced a naive string that was then reinterpreted
+// against the column's timezone, landing an offset away from the true instant
+// on any non-UTC server.
 
 // ── PostgreSQL binary wire format decoder ───────────────────────────────
 
@@ -191,18 +168,20 @@ pub fn decode_binary_value(oid: u32, data: &[u8]) -> String {
                 "1970-01-01 00:00:00.000000".to_string()
             }
         }
-        // timestamptz (1184) — same encoding as timestamp, already in UTC
+        // timestamptz (1184) — same encoding as timestamp, already in UTC.
+        // Emit an explicit +00:00 so ClickHouse stores the instant rather than
+        // reinterpreting the digits against the mirror's timezone.
         1184 => {
             if data.len() == 8 {
                 let us = i64::from_be_bytes(data.try_into().unwrap());
                 let secs = us / 1_000_000 + PG_EPOCH_UNIX;
                 let nsecs = ((us % 1_000_000) * 1000) as u32;
                 match chrono::DateTime::from_timestamp(secs, nsecs) {
-                    Some(dt) => dt.format("%Y-%m-%d %H:%M:%S%.6f").to_string(),
-                    None => "1970-01-01 00:00:00.000000".to_string(),
+                    Some(dt) => dt.format("%Y-%m-%d %H:%M:%S%.6f+00:00").to_string(),
+                    None => "1970-01-01 00:00:00.000000+00:00".to_string(),
                 }
             } else {
-                "1970-01-01 00:00:00.000000".to_string()
+                "1970-01-01 00:00:00.000000+00:00".to_string()
             }
         }
         // uuid — 16 bytes raw
@@ -336,8 +315,8 @@ pub fn tuple_to_strings(values: &[TupleData], rel: &RelationInfo) -> Vec<String>
                 TupleData::Text(s) => match oid {
                     // bool — PG sends "t"/"f", ClickHouse UInt8 needs "1"/"0"
                     16 => if s == "t" { "1".to_string() } else { "0".to_string() },
-                    // timestamptz — convert to UTC
-                    1184 => timestamptz_to_utc(s),
+                    // Everything else, timestamps included, goes through
+                    // verbatim — see "Timestamp handling" above.
                     _ => s.clone(),
                 },
                 TupleData::Binary(data) => decode_binary_value(oid, data),

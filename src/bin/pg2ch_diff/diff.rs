@@ -37,7 +37,7 @@ pub fn run_diff(config: &DiffConfig, skip_snapshot: bool, keep_snapshot: bool) -
     let dst = &config.destination;
 
     let pg = PgClient::connect(&src.host, src.port, &src.database, &src.user, &src.password)?;
-    let ch = ChClient::new(&dst.host, dst.port, &dst.user, &dst.password, config.ch_timeout_secs);
+    let ch = ChClient::new(&dst.host, dst.port, &dst.user, &dst.password, config.ch_timeout_secs, &config.timezone);
 
     let mut results: Vec<TableResult> = Vec::new();
 
@@ -345,7 +345,7 @@ fn diff_table(
         // Spawn progress monitor thread
         let snap_table_clone = snapshot_table.clone();
         let dst = &config.destination;
-        let monitor_ch = ChClient::new(&dst.host, dst.port, &dst.user, &dst.password, 60);
+        let monitor_ch = ChClient::new(&dst.host, dst.port, &dst.user, &dst.password, 60, &config.timezone);
         let pg_est_for_monitor = pg_est_count;
         let stop_monitor = Arc::new(AtomicBool::new(false));
         let stop_flag = stop_monitor.clone();
