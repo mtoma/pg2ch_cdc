@@ -3,6 +3,11 @@
 `timezone:` is mandatory in every mirror and diff config. There is no default,
 and adding one would reintroduce the bug the setting exists to prevent.
 
+It sets the timezone for **newly created** tables and for pinning columns that
+never declared one. For a table that already declares a timezone, **the column
+type wins** — see "The column type is the authority" below. That is deliberate:
+it lets a mirror be migrated one table at a time.
+
 ## The type mismatch this resolves
 
 | PostgreSQL | What it is | Carries a timezone? |
@@ -66,6 +71,46 @@ It is deliberately awkward: no default, has to be written into the config, and
 prints a ten-line warning each run. Do not set it for a new mirror — there is
 no reason to choose a lossy convention from scratch.
 
+## The column type is the authority
+
+The two write paths resolve naive timestamps differently, and the difference
+decides what a mixed-convention mirror can do. Measured on ClickHouse 26.4,
+inserting the naive string `2020-06-15 12:00:00` into three columns in one
+request:
+
+| `session_timezone` | `DateTime64(6,'Europe/Paris')` | `DateTime64(6,'UTC')` | `DateTime64(6)` |
+|---|---|---|---|
+| Europe/Paris | 1592215200 | 1592222400 | 1592215200 |
+| UTC | 1592215200 | 1592222400 | **1592222400** |
+
+**A TabSeparated insert is column-aware.** A column that declares a timezone
+parses against *that* timezone and ignores `session_timezone` entirely; only a
+bare column follows the session. So CDC writes every column correctly whatever
+convention each is on, with no coordination — even two different conventions in
+one table, in one insert.
+
+**The `postgresql()` initial load is not.** It resolves the naive value once per
+request and merely copies the resulting instant into the column, so only the
+column whose timezone matches `session_timezone` reads back correctly. Same PG
+value `1989-06-21 00:00:00`, loaded into the same three columns:
+
+| `session_timezone` | Paris col | UTC col | bare col |
+|---|---|---|---|
+| Europe/Paris | `00:00:00` ✓ | `1989-06-20 22:00:00` ✗ | `00:00:00` ✓ |
+| UTC | `02:00:00` ✗ | `00:00:00` ✓ | `02:00:00` ✗ |
+
+Hence the design:
+
+- `resolve_table_timezone` reads each existing table's convention from its
+  column types and **adopts** it. A table on a different timezone from the
+  config is normal, not an error — it is what an incremental migration looks
+  like halfway through.
+- The load `INSERT` carries `SETTINGS session_timezone = '<that table's tz>'`,
+  which overrides the client-wide default. CDC needs no such handling.
+- A table whose own DateTime columns disagree gets a **warning**, not a stop:
+  its initial load is impossible, but its CDC is fine. Migrate all of a table's
+  DateTime columns together and this never arises.
+
 ## How the pieces fit
 
 - **Column types** — `clickhouse::pin_datetime_timezone` writes the configured
@@ -91,31 +136,47 @@ no reason to choose a lossy convention from scratch.
   audit column that nothing joins on, so this is left alone deliberately rather
   than rewritten; the data columns are what matter. If you want it uniform,
   rewrite it with the same two-step `ALTER` as any other column.
-- **Existing tables** are checked by `ensure_timezone_pinned`. Where the stored
-  timezone matches the config it pins the type (metadata-only — ClickHouse
-  rewrites no data for a timezone-only `MODIFY COLUMN`). Where it differs, or
-  where an unpinned column sits on a server default that contradicts the config,
-  it bails with the `ALTER` statements needed to migrate. It never writes two
-  conventions into one column.
+- **Existing tables** go through `resolve_table_timezone`. It adopts whatever
+  the columns declare and pins any column that declares nothing (metadata-only —
+  ClickHouse rewrites no data for a timezone-only `MODIFY COLUMN`). A table that
+  predates pinning is pinned to the **server default**, because that is what its
+  stored instants actually mean; if that differs from the config it says so and
+  explains how to migrate.
 
 ## Migrating an existing mirror
 
-For a mirror already running on the server default, set `timezone:` to that
-same value first. pg2ch_cdc will pin every column, which changes nothing
-observable and makes the data immune to a later server-config change. Only
-then consider moving to UTC, per column:
+No full reload, and no config change. Migrate **one table at a time**; the next
+run adopts each table as you go.
+
+Set `timezone:` to the server default first, so every column gets pinned to what
+it actually holds. Then, per table, migrate all of its DateTime columns together:
 
 ```sql
--- 1. shift the instants so the UTC reading equals the old reading
+-- 1. shift the instants so the new reading equals the old one.
+--    ONLY for columns from a PG `timestamp` (a wall clock).
 ALTER TABLE db.tbl UPDATE col = toDateTime64(toString(col, '<old_tz>'), 6, 'UTC') WHERE 1;
--- 2. restate the type (metadata-only)
+
+-- 2. restate the types (metadata-only, and the only step a `timestamptz`
+--    column needs — its instant is already correct, only its display moves).
 ALTER TABLE db.tbl MODIFY COLUMN col Nullable(DateTime64(6, 'UTC'));
 ```
 
-Run the pair per table: between the two statements the column reads wrong.
+Between the two statements that column reads wrong, so run them as a pair. Wait
+for `system.mutations` to drain before step 2.
+
+Two things to know before pricing it:
+
+- **A mutation rewrites only the columns it changes**; the rest are hardlinked.
+  So the cost is the size of those columns, not of the table.
+- **A column in the sorting key cannot be `UPDATE`d** (`Cannot UPDATE key
+  column`, code 420) — `MODIFY` still works, but shifting its values requires
+  rebuilding the table (`INSERT INTO new SELECT …`, then `RENAME`).
+
 Values that fell in a spring-forward gap under the old timezone were already
-lost and step 1 preserves the error — those rows must be re-read from
-PostgreSQL by primary key.
+lost, and step 1 faithfully preserves that error — those rows have to be re-read
+from PostgreSQL by primary key. Narrow the candidate set in ClickHouse first
+(see the detection query above); it is a few tens of thousands of rows, so the
+repair is index lookups, not a scan.
 
 ## Testing
 

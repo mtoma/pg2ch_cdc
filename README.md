@@ -163,11 +163,28 @@ naming the exposure. It exists so an existing deployment is not forced into a
 full migration just to start up — not as a way to avoid choosing UTC for a new
 one.
 
-On an existing table, pg2ch_cdc compares the stored timezone against the
-config. It pins the type where they agree — a metadata-only change that rewrites
-no data — and refuses to run where they disagree, rather than writing two
-conventions into one column. The error message includes the `ALTER` statements
-to migrate deliberately.
+### The column type is the authority
+
+`timezone:` sets the timezone for **newly created** tables. For a table that
+already declares one, the column type wins — pg2ch_cdc adopts it. So a mirror
+can be migrated one table at a time, with no config change and no reload.
+
+This works because the two write paths differ. A TabSeparated insert (CDC) is
+**column-aware**: a column declaring a timezone parses against that timezone and
+ignores `session_timezone`, so CDC writes every column correctly whatever
+convention each is on. The `postgresql()` initial load is **not** — it resolves
+naive values once per request — so each table's load runs with
+`SETTINGS session_timezone` set to that table's own timezone.
+
+A table whose own DateTime columns disagree with each other gets a warning
+rather than a stop: only its initial load is impossible, and migrating all of a
+table's DateTime columns together avoids it. Columns that declare nothing are
+pinned to the ClickHouse server default, because that is what their stored
+instants actually mean.
+
+See `.claude/rules/timezones.md` for the migration steps and their real cost
+(a mutation rewrites only the columns it changes; a sorting-key column cannot be
+`UPDATE`d and needs a table rebuild).
 
 ### Consistency model
 

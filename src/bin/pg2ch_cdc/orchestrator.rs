@@ -220,6 +220,9 @@ pub fn run_mirror(config: &MirrorConfig) -> Result<()> {
         ch_table_exists: bool,
         ch_has_rows: bool,
         reload_reason: ReloadReason,
+        /// Timezone this table's timestamps are stored in — read from the
+        /// column types, not the config. `None` if its columns disagree.
+        timezone: Option<String>,
     }
 
     let mut table_infos: Vec<TableInfo> = Vec::new();
@@ -237,12 +240,16 @@ pub fn run_mirror(config: &MirrorConfig) -> Result<()> {
         ))?.trim().to_string();
         let ch_table_exists = ch_exists == "1";
 
-        // Refuse to write a second timezone convention into an existing
-        // table, and pin the type where the stored convention already
-        // matches the config (metadata-only).
-        if ch_table_exists {
-            ensure_timezone_pinned(&ch, &ch_table, &config.timezone, &ch_server_tz)?;
-        }
+        // Adopt whatever timezone this table already stores, pinning it into
+        // the column types where it was only implied. A table on a different
+        // convention from the config is legitimate — that is how an
+        // incremental migration looks midway through.
+        let table_timezone = if ch_table_exists {
+            resolve_table_timezone(&ch, &ch_table, &config.timezone, &ch_server_tz)?
+        } else {
+            // Created below with the configured timezone.
+            Some(config.timezone.clone())
+        };
 
         let pg_est_rows = pg.query(&format!(
             "SELECT reltuples::bigint FROM pg_class \
@@ -341,6 +348,7 @@ pub fn run_mirror(config: &MirrorConfig) -> Result<()> {
             ch_table_exists,
             ch_has_rows,
             reload_reason,
+            timezone: table_timezone,
         });
     }
 
@@ -470,17 +478,19 @@ pub fn run_mirror(config: &MirrorConfig) -> Result<()> {
             tables_to_load.len(), parallel
         );
 
-        // Queue includes pg_rows_est for progress monitoring and pg_oid for _pg2ch_rel_id
-        let load_items: Vec<(String, String, String, String, i64, u32)> = tables_to_load.iter()
+        // Queue includes pg_rows_est for progress monitoring, pg_oid for
+        // _pg2ch_rel_id, and the table's own timezone for the load.
+        type LoadItem = (String, String, String, String, i64, u32, Option<String>);
+        let load_items: Vec<LoadItem> = tables_to_load.iter()
             .map(|ti| {
                 let ch_table = config.ch_table_name(&ti.table);
                 let (ch_db, ch_tbl) = ch_table.split_once('.').unwrap_or(("default", &ch_table));
-                (ti.table.clone(), ch_table.clone(), ch_db.to_string(), ch_tbl.to_string(), ti.pg_rows_est, ti.pg_oid)
+                (ti.table.clone(), ch_table.clone(), ch_db.to_string(), ch_tbl.to_string(), ti.pg_rows_est, ti.pg_oid, ti.timezone.clone())
             })
             .collect();
 
         let errors: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
-        let queue: Arc<Mutex<std::collections::VecDeque<(String, String, String, String, i64, u32)>>> =
+        let queue: Arc<Mutex<std::collections::VecDeque<LoadItem>>> =
             Arc::new(Mutex::new(load_items.into_iter().collect()));
 
         let mut handles = Vec::new();
@@ -509,9 +519,23 @@ pub fn run_mirror(config: &MirrorConfig) -> Result<()> {
                         let mut q = queue.lock().unwrap();
                         q.pop_front()
                     };
-                    let (table, ch_table, ch_db, ch_tbl, pg_rows_est, _) = match item {
+                    let (table, ch_table, ch_db, ch_tbl, pg_rows_est, _, table_tz) = match item {
                         Some(item) => item,
                         None => break,
+                    };
+
+                    // The load resolves naive PG timestamps once for the whole
+                    // INSERT, so it needs one unambiguous timezone. Only this
+                    // table is skipped; the rest of the mirror is unaffected.
+                    let Some(table_tz) = table_tz else {
+                        let msg = format!(
+                            "{}: cannot initial-load a table whose DateTime columns declare \
+                             different timezones — migrate them together first",
+                            table
+                        );
+                        error!("[W{}] {}", worker_id, msg);
+                        errors.lock().unwrap().push(msg);
+                        continue;
                     };
 
                     // Get column names
@@ -542,13 +566,20 @@ pub fn run_mirror(config: &MirrorConfig) -> Result<()> {
                         }
                     };
 
+                    // session_timezone must match THIS table's timezone: unlike a
+                    // TabSeparated insert (where each column parses against its own
+                    // declared timezone), postgresql() resolves naive timestamps once
+                    // per request, and the resulting instant is merely copied into the
+                    // column. A query-level SETTINGS overrides the client-wide default.
                     let insert = format!(
                         "INSERT INTO {} ({}, _pg2ch_rel_id, _pg2ch_synced_at, _pg2ch_is_deleted, _pg2ch_version) \
-                         SELECT *, {}, now64(), 0, 0 FROM postgresql('{}:{}', '{}', '{}', '{}', '{}', '{}')",
+                         SELECT *, {}, now64(), 0, 0 FROM postgresql('{}:{}', '{}', '{}', '{}', '{}', '{}') \
+                         SETTINGS session_timezone = '{}'",
                         ch_table,
                         columns.join(", "),
                         pg_oid,
-                        src_host, src_port, src_database, table, src_user, src_password, src_schema
+                        src_host, src_port, src_database, table, src_user, src_password, src_schema,
+                        table_tz
                     );
 
                     info!("[W{}] Loading {}.{} → {} (~{} rows)...", worker_id, src_schema, table, ch_table, pg_rows_est);
@@ -768,22 +799,23 @@ fn validate_timezone_in_ch(ch: &ChClient, tz: &str, allow_dst: bool) -> Result<(
     Ok(())
 }
 
-/// Verify an existing ClickHouse table stores timestamps in the configured
-/// timezone, pinning the type where it is safe to do so.
+/// Resolve which timezone an existing ClickHouse table stores timestamps in,
+/// and make that choice explicit in the column types.
 ///
-/// A DateTime column with no timezone in its type is resolved against the
-/// ClickHouse *server* default, which is invisible from the config and can be
-/// changed underneath us. Pinning it is metadata-only (no data rewrite), so we
-/// do it whenever the server default already agrees with the config — the
-/// stored instants are then documented rather than merely assumed. When they
-/// disagree, the stored data is on a different convention from the one
-/// configured and we refuse rather than write a mixture into the same column.
-fn ensure_timezone_pinned(
+/// The column type is the authority, not the config. A column that declares a
+/// timezone parses and renders against that timezone no matter what the
+/// session or the config says, so a table already migrated to another
+/// convention is not a problem to be refused — it is a fact to be adopted.
+/// That is what lets a mirror be migrated one table at a time.
+///
+/// Returns the table's timezone, or `None` if its DateTime columns disagree
+/// with each other (which only obstructs an initial load — see the loader).
+fn resolve_table_timezone(
     ch: &ChClient,
     ch_table: &str,
-    tz: &str,
+    config_tz: &str,
     server_tz: &str,
-) -> Result<()> {
+) -> Result<Option<String>> {
     let (ch_db, ch_tbl) = ch_table.split_once('.').unwrap_or(("default", ch_table));
     // TabSeparatedRaw: TabSeparated escapes the quotes inside the type string.
     let rows = ch.query(&format!(
@@ -792,66 +824,83 @@ fn ensure_timezone_pinned(
         ch_db, ch_tbl
     ))?;
 
-    let mut to_pin: Vec<(String, String)> = Vec::new();
+    let mut declared: Vec<(String, String)> = Vec::new();
+    let mut bare: Vec<(String, String)> = Vec::new();
     for line in rows.lines().filter(|l| !l.trim().is_empty()) {
         let Some((name, ch_type)) = line.split_once('\t') else { continue };
         if !has_datetime(ch_type) {
             continue;
         }
         match datetime_timezone(ch_type) {
-            Some(existing) if existing == tz => {}
-            Some(existing) => bail!(
-                "{}.{} stores timestamps in '{}' but the config says timezone: {}\n\n\
-                 The column type is {}. Its stored instants were written on the '{}' \
-                 convention; reading them as '{}' shifts every value in the column by \
-                 the offset between them. pg2ch_cdc will not write both conventions \
-                 into one column.\n\n\
-                 Either set `timezone: {}` to keep the existing convention, or migrate \
-                 the column deliberately:\n\n    \
-                 ALTER TABLE {} UPDATE {} = toDateTime64(toString({}, '{}'), 6, '{}') WHERE 1;\n    \
-                 ALTER TABLE {} MODIFY COLUMN {} <type with '{}'>;\n\n\
-                 The UPDATE rewrites the column; the MODIFY is metadata-only. Between \
-                 them the column reads wrong, so run them as a pair per table.",
-                ch_table, name, existing, tz,
-                ch_type, existing, tz,
-                existing,
-                ch_table, name, name, existing, tz,
-                ch_table, name, tz,
-            ),
-            None if server_tz == tz => {
-                to_pin.push((name.to_string(), pin_datetime_timezone(ch_type, tz)));
-            }
-            None => bail!(
-                "{}.{} does not state its timezone, so it is stored on the ClickHouse \
-                 server default '{}' — but the config says timezone: {}\n\n\
-                 The column type is {}. Pinning it to '{}' would not move the stored \
-                 instants, so every value in the column would read an offset away from \
-                 what was written.\n\n\
-                 Either set `timezone: {}` to adopt the convention the data is already \
-                 on (pg2ch_cdc will then pin the type for you, which is metadata-only \
-                 and changes nothing observable), or migrate the column to '{}' \
-                 deliberately before changing the config.",
-                ch_table, name, server_tz, tz,
-                ch_type, tz,
-                server_tz, tz,
-            ),
+            Some(tz) => declared.push((name.to_string(), tz)),
+            None => bare.push((name.to_string(), ch_type.to_string())),
         }
     }
 
-    if !to_pin.is_empty() {
+    if declared.is_empty() && bare.is_empty() {
+        // No DateTime columns; the value is irrelevant for this table.
+        return Ok(Some(config_tz.to_string()));
+    }
+
+    // A table whose columns disagree cannot be initial-loaded correctly: the
+    // load resolves naive values once per INSERT, so only the columns matching
+    // that one timezone come out right. CDC is unaffected (it parses per
+    // column), so warn rather than stop.
+    let distinct: HashSet<&str> = declared.iter().map(|(_, tz)| tz.as_str()).collect();
+    if distinct.len() > 1 {
+        warn!(
+            "{} mixes timezones across its DateTime columns ({}). CDC handles this \
+             correctly — each column parses against its own timezone — but an initial \
+             load of this table cannot. Migrate all of a table's DateTime columns together.",
+            ch_table,
+            declared.iter()
+                .map(|(n, tz)| format!("{}={}", n, tz))
+                .collect::<Vec<_>>().join(", ")
+        );
+        return Ok(None);
+    }
+
+    // The table's convention: what its columns already declare, else — for a
+    // table created before timezones were pinned — whatever the ClickHouse
+    // server default was when it was written.
+    let table_tz = match distinct.into_iter().next() {
+        Some(tz) => tz.to_string(),
+        None => {
+            if server_tz != config_tz {
+                warn!(
+                    "{} predates timezone pinning, so its timestamps are stored on the \
+                     ClickHouse server default '{}', not the configured '{}'. Pinning it to \
+                     '{}' to record what the data actually is. To move it to '{}', rewrite it \
+                     first — see .claude/rules/timezones.md — and this run will then adopt it.",
+                    ch_table, server_tz, config_tz, server_tz, config_tz
+                );
+            }
+            server_tz.to_string()
+        }
+    };
+
+    if !bare.is_empty() {
         // Metadata-only: ClickHouse rewrites no data for a timezone-only
         // change, so this is safe on a table of any size.
-        let clauses: Vec<String> = to_pin
+        let clauses: Vec<String> = bare
             .iter()
-            .map(|(name, ty)| format!("MODIFY COLUMN `{}` {}", name, ty))
+            .map(|(name, ty)| {
+                format!("MODIFY COLUMN `{}` {}", name, pin_datetime_timezone(ty, &table_tz))
+            })
             .collect();
         ch.query(&format!("ALTER TABLE {} {}", ch_table, clauses.join(", ")))?;
         info!(
             "  Pinned timezone '{}' on {} column(s) of {} (metadata-only)",
-            tz, to_pin.len(), ch_table
+            table_tz, bare.len(), ch_table
+        );
+    } else if table_tz != config_tz {
+        info!(
+            "  {} stores timestamps in '{}' (config default is '{}') — using the table's own",
+            ch_table, table_tz, config_tz
         );
     }
-    Ok(())
+
+    Ok(Some(table_tz))
 }
 
 /// Create CH table from PG schema using DESCRIBE TABLE postgresql().

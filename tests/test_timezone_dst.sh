@@ -304,6 +304,59 @@ echo "=== Re-running with the original timezone is still idempotent ==="
 "$BIN_DIR/pg2ch_cdc" --config "$MIRROR_CONFIG" --plain
 compare_all "after re-run"
 
+echo "=== A table on a DIFFERENT timezone from the config must be adopted, not refused ==="
+# This is what an incremental, table-by-table migration looks like midway
+# through. The column type is the authority; the config only supplies the
+# default for new tables.
+#
+# Note the two column kinds migrate differently:
+#   naive_ts (from PG `timestamp`) is a WALL CLOCK  -> shift the instant so the
+#           reading is preserved, then restate the type.
+#   tz_ts    (from PG `timestamptz`) is an INSTANT  -> restate the type only;
+#           shifting it would corrupt a value that is already correct.
+ch_query "ALTER TABLE $CH_DATABASE.events UPDATE naive_ts = toDateTime64(toString(naive_ts,'UTC'), 6, 'Etc/GMT-1') WHERE 1"
+for i in $(seq 1 60); do
+    DONE=$(ch_query "SELECT count() FROM system.mutations WHERE database='$CH_DATABASE' AND table='events' AND NOT is_done" | tr -d '[:space:]')
+    [ "$DONE" = "0" ] && break
+    sleep 1
+done
+ch_query "ALTER TABLE $CH_DATABASE.events MODIFY COLUMN naive_ts Nullable(DateTime64(6, 'Etc/GMT-1')), MODIFY COLUMN tz_ts Nullable(DateTime64(6, 'Etc/GMT-1'))"
+MIG_TYPES=$(ch_query "SELECT name, type FROM system.columns WHERE database='$CH_DATABASE' AND table='events' AND name IN ('naive_ts','tz_ts') FORMAT TabSeparatedRaw")
+echo "$MIG_TYPES" | grep -q "Etc/GMT-1" || fail "migration did not restate the types: $MIG_TYPES"
+
+# The config still says UTC. The run must succeed and adopt Etc/GMT-1.
+OUT=$("$BIN_DIR/pg2ch_cdc" --config "$MIRROR_CONFIG" --plain 2>&1) \
+    || { echo "$OUT"; fail "a table on a non-config timezone was refused"; }
+echo "$OUT" | grep -q "stores timestamps in 'Etc/GMT-1'" \
+    || fail "run did not report adopting the table's own timezone: $OUT"
+compare_all "after migrating one table to Etc/GMT-1"
+echo "adopted the table's timezone, values preserved"
+
+echo "=== CDC must keep writing that table correctly (parses per column) ==="
+# The client-wide session_timezone is still UTC, but a declared column parses
+# against its own timezone — so these must land exactly, gap value included.
+$PSQL <<'SQL'
+INSERT INTO test_tz.events (id, label, naive_ts, tz_ts) VALUES
+    (30, 'post-migration gap',    '2024-03-31 02:20:00', '2024-03-31 02:20:00+01'),
+    (31, 'post-migration normal', '2024-08-01 09:15:00', '2024-08-01 09:15:00+02'),
+    (32, 'post-migration null',   NULL, NULL);
+SQL
+"$BIN_DIR/pg2ch_cdc" --config "$MIRROR_CONFIG" --plain
+compare_all "cdc into a migrated table"
+MIGRATED_TZ=$(ch_query "SELECT type FROM system.columns WHERE database='$CH_DATABASE' AND table='events' AND name='naive_ts' FORMAT TabSeparatedRaw")
+echo "$MIGRATED_TZ" | grep -q "Etc/GMT-1" || fail "CDC run changed the table's timezone: $MIGRATED_TZ"
+echo "CDC wrote a non-config-timezone table correctly and left its type alone"
+
+echo "=== A table whose columns disagree must warn, not stop ==="
+# Only that table's initial load is impossible; CDC is unaffected.
+ch_query "ALTER TABLE $CH_DATABASE.events MODIFY COLUMN tz_ts Nullable(DateTime64(6, 'UTC'))"
+OUT=$("$BIN_DIR/pg2ch_cdc" --config "$MIRROR_CONFIG" --plain 2>&1) \
+    || { echo "$OUT"; fail "a table with mixed column timezones stopped the run"; }
+echo "$OUT" | grep -qi "mixes timezones" || fail "no warning for mixed column timezones: $OUT"
+echo "warned and carried on"
+# Put it back so the table is internally consistent again.
+ch_query "ALTER TABLE $CH_DATABASE.events MODIFY COLUMN tz_ts Nullable(DateTime64(6, 'Etc/GMT-1'))"
+
 echo "=== Cleanup ==="
 rm -f "$MIRROR_CONFIG" "$DIFF_CONFIG" "$BAD_CONFIG"
 ch_query "DROP DATABASE IF EXISTS $CH_DATABASE"

@@ -36,6 +36,9 @@ This tool is an **rsync for PostgreSQL → ClickHouse**. Every design decision f
   `postgresql()` initial-load path, which runs inside ClickHouse.
 - Don't give `timezone:` a default. An invisible default is the bug this
   setting exists to prevent.
+- Don't make the config override a table's existing timezone. The column type is
+  the authority; the config is only the default for new tables. Overriding it
+  would force an all-or-nothing migration of the whole mirror.
 - Don't change the publication/slot naming convention: `pg2ch_{mirror_name}`.
 - Test against the real servers (see CLAUDE.md for hostnames), and run
   `tests/*.sh` against containers. **ClickHouse must run on a DST-observing
