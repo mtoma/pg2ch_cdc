@@ -12,7 +12,7 @@ use std::sync::Arc;
 use std::time::Instant;
 use tracing::{info, warn};
 
-use pg2ch_cdc::clickhouse::ChClient;
+use pg2ch_cdc::clickhouse::{datetime_timezone, ChClient};
 use pg2ch_cdc::pg::PgClient;
 
 use crate::col_types::{self, Column};
@@ -323,11 +323,13 @@ fn diff_table(
         ch.query(&format!("DROP TABLE IF EXISTS {} SYNC", snapshot_table))?;
     }
 
-        // Create empty table with same structure as CDC table (minus _pg2ch_* columns)
+        // Create empty table with same structure as CDC table (minus _pg2ch_* columns).
+        // TabSeparatedRaw, not TabSeparated: the latter escapes the quotes inside a
+        // timezone-qualified DateTime64, and the escaped form is invalid DDL.
         let data_columns = ch.query(&format!(
             "SELECT name, type FROM system.columns \
              WHERE database = '{}' AND table = '{}' AND name NOT LIKE '_pg2ch%' \
-             ORDER BY position FORMAT TabSeparated",
+             ORDER BY position FORMAT TabSeparatedRaw",
             config.destination.database, table
         ))?.trim().to_string();
         let col_defs: Vec<String> = data_columns.lines()
@@ -375,10 +377,19 @@ fn diff_table(
             }
         });
 
-        // Run the actual INSERT
+        // Run the actual INSERT.
+        //
+        // The snapshot's DateTime columns were copied from the mirror, so they
+        // carry the mirror's timezone. postgresql() resolves naive PostgreSQL
+        // timestamps once per request and copies the resulting instant, so
+        // session_timezone must match that timezone or every value in the
+        // snapshot lands an offset away and the diff reports mismatches that
+        // are entirely its own doing.
+        let snapshot_tz = datetime_timezone(&data_columns)
+            .unwrap_or_else(|| config.timezone.clone());
         ch.query(&format!(
-            "INSERT INTO {} SELECT * FROM {}",
-            snapshot_table, pg_func
+            "INSERT INTO {} SELECT * FROM {} SETTINGS session_timezone = '{}'",
+            snapshot_table, pg_func, snapshot_tz
         ))?;
 
         stop_monitor.store(true, Ordering::Relaxed);
