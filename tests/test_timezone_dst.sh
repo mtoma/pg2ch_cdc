@@ -335,7 +335,10 @@ for i in $(seq 1 60); do
     [ "$DONE" = "0" ] && break
     sleep 1
 done
-ch_query "ALTER TABLE $CH_DATABASE.events MODIFY COLUMN naive_ts Nullable(DateTime64(6, 'Etc/GMT-1')), MODIFY COLUMN tz_ts Nullable(DateTime64(6, 'Etc/GMT-1'))"
+# ALL of the table's DateTime columns move together, _pg2ch_synced_at included.
+# Leaving one behind makes the table internally mixed, which is a different case
+# (asserted further down) and is why the docs say to migrate a whole table.
+ch_query "ALTER TABLE $CH_DATABASE.events MODIFY COLUMN naive_ts Nullable(DateTime64(6, 'Etc/GMT-1')), MODIFY COLUMN tz_ts Nullable(DateTime64(6, 'Etc/GMT-1')), MODIFY COLUMN _pg2ch_synced_at DateTime64(9, 'Etc/GMT-1')"
 MIG_TYPES=$(ch_query "SELECT name, type FROM system.columns WHERE database='$CH_DATABASE' AND table='events' AND name IN ('naive_ts','tz_ts') FORMAT TabSeparatedRaw")
 echo "$MIG_TYPES" | grep -q "Etc/GMT-1" || fail "migration did not restate the types: $MIG_TYPES"
 

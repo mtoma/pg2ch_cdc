@@ -134,19 +134,6 @@ jobs:
           TEST_CH_PASSWORD: ""
         run: bash tests/test_pk_update.sh
 
-      - name: Test timezone and DST handling
-        env:
-          TEST_PG_HOST: localhost
-          TEST_PG_PORT: "5432"
-          TEST_PG_USER: test
-          TEST_PG_PASSWORD: test
-          TEST_PG_DATABASE: test_db
-          TEST_CH_HOST: localhost
-          TEST_CH_PORT: "8123"
-          TEST_CH_USER: default
-          TEST_CH_PASSWORD: ""
-        run: bash tests/test_timezone_dst.sh
-
       - name: Test slot advances through unrelated WAL
         env:
           TEST_PG_HOST: localhost
@@ -159,3 +146,16 @@ jobs:
           TEST_CH_USER: default
           TEST_CH_PASSWORD: ""
         run: bash tests/test_slot_advance_unrelated_wal.sh
+
+      - name: Test timezone and DST handling
+        env:
+          TEST_PG_HOST: localhost
+          TEST_PG_PORT: "5432"
+          TEST_PG_USER: test
+          TEST_PG_PASSWORD: test
+          TEST_PG_DATABASE: test_db
+          TEST_CH_HOST: localhost
+          TEST_CH_PORT: "8123"
+          TEST_CH_USER: default
+          TEST_CH_PASSWORD: ""
+        run: bash tests/test_timezone_dst.sh
