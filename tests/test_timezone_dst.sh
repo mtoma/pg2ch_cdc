@@ -309,6 +309,13 @@ OUT=$("$BIN_DIR/pg2ch_cdc" --config "$BAD_CONFIG" --plain 2>&1) \
     || { echo "$OUT"; fail "a config timezone differing from the table stopped the run"; }
 echo "$OUT" | grep -q "stores timestamps in 'UTC'" \
     || fail "run did not report adopting the table's own timezone: $OUT"
+# The disagreement must be a WARNING, not a quiet informational line: a typo in
+# `timezone:` no longer stops the run, so it has to be visible. And the message
+# has to say what a mistake would cost — new tables on the config's timezone.
+echo "$OUT" | grep -qi "config says timezone: Asia/Kolkata" \
+    || fail "warning does not name the configured timezone: $OUT"
+echo "$OUT" | grep -q "any NEW table will be created in 'Asia/Kolkata'" \
+    || fail "warning does not say what a wrong config would cost: $OUT"
 STILL_UTC=$(ch_query "SELECT type FROM system.columns WHERE database='$CH_DATABASE' AND table='events' AND name='naive_ts' FORMAT TabSeparatedRaw")
 echo "$STILL_UTC" | grep -q "'UTC'" \
     || fail "the config overwrote the table's timezone: $STILL_UTC"

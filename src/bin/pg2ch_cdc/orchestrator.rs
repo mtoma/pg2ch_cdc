@@ -893,10 +893,21 @@ fn resolve_table_timezone(
             "  Pinned timezone '{}' on {} column(s) of {} (metadata-only)",
             table_tz, bare.len(), ch_table
         );
-    } else if table_tz != config_tz {
-        info!(
-            "  {} stores timestamps in '{}' (config default is '{}') — using the table's own",
-            ch_table, table_tz, config_tz
+    }
+
+    // Reported whether or not anything was pinned above: a disagreement between
+    // the table and the config is either a migration in progress or a mistake,
+    // and the two are indistinguishable from here. Warn rather than inform so
+    // the mistake is visible — a wrong `timezone:` no longer stops the run, and
+    // silence would let it create new tables on a second convention unnoticed.
+    if table_tz != config_tz {
+        warn!(
+            "{} stores timestamps in '{}' but the config says timezone: {} — \
+             using the table's own '{}'. The column type is the authority, so this \
+             is expected part-way through a per-table migration. If it is not \
+             deliberate then the config is wrong: any NEW table will be created in \
+             '{}', leaving the mirror on two conventions.",
+            ch_table, table_tz, config_tz, table_tz, config_tz
         );
     }
 

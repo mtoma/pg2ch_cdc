@@ -136,6 +136,12 @@ Hence the design:
   audit column that nothing joins on, so this is left alone deliberately rather
   than rewritten; the data columns are what matter. If you want it uniform,
   rewrite it with the same two-step `ALTER` as any other column.
+- **A table whose timezone differs from the config warns.** Adopting the table's
+  own timezone is right for a migration in progress, but from inside the process
+  a deliberate migration and a typo'd `timezone:` look identical — and since the
+  disagreement no longer stops the run, silence would let a wrong config create
+  new tables on a second convention unnoticed. The warning names both timezones
+  and says which one new tables would get.
 - **Existing tables** go through `resolve_table_timezone`. It adopts whatever
   the columns declare and pins any column that declares nothing (metadata-only —
   ClickHouse rewrites no data for a timezone-only `MODIFY COLUMN`). A table that
