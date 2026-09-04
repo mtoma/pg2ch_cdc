@@ -298,15 +298,22 @@ fi
 echo "$OUT" | grep -q "timezone: UTC" || fail "missing-timezone message does not say what to add: $OUT"
 echo "refused, and the message says what to add"
 
-echo "=== Contradicting an existing table's timezone must be refused ==="
-# The table above is stored on UTC. Asking for a different (DST-free)
-# timezone would read every value an offset away from what was written.
+echo "=== A config timezone that disagrees with the table must NOT override it ==="
+# The table is stored on UTC. Pointing a config at a different (DST-free)
+# timezone must neither be refused nor silently applied: the column type is the
+# authority, so the run adopts UTC and leaves the data and the type alone.
+# Overriding here would read every value an offset away from what was written,
+# and refusing would force an all-or-nothing migration of the whole mirror.
 write_config "$BAD_CONFIG" "Asia/Kolkata"
-if OUT=$("$BIN_DIR/pg2ch_cdc" --config "$BAD_CONFIG" --plain 2>&1); then
-    fail "timezone: Asia/Kolkata was accepted against a table stored on UTC"
-fi
-echo "$OUT" | grep -q "stores timestamps in 'UTC'" || fail "mismatch message unclear: $OUT"
-echo "refused, and the message names both conventions"
+OUT=$("$BIN_DIR/pg2ch_cdc" --config "$BAD_CONFIG" --plain 2>&1) \
+    || { echo "$OUT"; fail "a config timezone differing from the table stopped the run"; }
+echo "$OUT" | grep -q "stores timestamps in 'UTC'" \
+    || fail "run did not report adopting the table's own timezone: $OUT"
+STILL_UTC=$(ch_query "SELECT type FROM system.columns WHERE database='$CH_DATABASE' AND table='events' AND name='naive_ts' FORMAT TabSeparatedRaw")
+echo "$STILL_UTC" | grep -q "'UTC'" \
+    || fail "the config overwrote the table's timezone: $STILL_UTC"
+compare_all "with a disagreeing config timezone"
+echo "adopted the table's UTC, left the type and the data untouched"
 
 echo "=== Re-running with the original timezone is still idempotent ==="
 "$BIN_DIR/pg2ch_cdc" --config "$MIRROR_CONFIG" --plain
