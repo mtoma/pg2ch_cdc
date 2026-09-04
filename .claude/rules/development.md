@@ -30,6 +30,12 @@ This tool is an **rsync for PostgreSQL → ClickHouse**. Every design decision f
 - Don't add async/tokio. The synchronous model is a deliberate choice.
 - Don't add abstractions for hypothetical future needs. Keep it concrete.
 - Don't change the `_pg2ch_*` column naming convention (synced_at, is_deleted, version).
+- Don't report an LSN to Postgres that ClickHouse does not already hold. Flush
+  first, promote second. The module docs in `cdc.rs` record what happened the
+  one time this was inverted.
+- Don't reintroduce task dependencies between the mirrors in the Airflow DAG.
+  They share a database; serialising them starves the waiting slots and that
+  filled the source's disk once already (see `architecture.md`).
 - Don't do timezone arithmetic in Rust. ClickHouse owns it — we set
   `session_timezone` and forward timestamp text verbatim. Doing it here would
   mean carrying a timezone database and keeping it in exact agreement with the

@@ -50,3 +50,42 @@ PG default replica identity sends only PK columns in DELETE messages. The tool f
 - Publication: `pg2ch_{mirror_name}` (e.g. `pg2ch_cstat`)
 - Replication slot: `pg2ch_{mirror_name}` (e.g. `pg2ch_cstat`)
 - CH table: `{destination.database}.{table_name}` (same name as PG source table)
+
+## Replication slot advancement
+
+A logical slot pins every WAL segment after its `restart_lsn`, and `restart_lsn`
+cannot pass what the client confirms. A client that only confirms changes it
+decoded **for its own publication** therefore pins all the WAL in between —
+including WAL belonging entirely to other tables.
+
+With several mirrors on one busy database this is not a corner case, it is the
+normal state. On 2026-09-04 a ~850 GB burst on the `ciq` tables held `cdc_ciq`
+for 2h49m; the serialised DAG meant `cdc_fds` never ran, its slot froze at
+`5CB7/8F0CC320`, PostgreSQL retained **2.1 TB** of WAL across 136,169 segments,
+and the source database filled its disk and shut down:
+
+```
+FATAL: could not extend file "base/16413/1196228965": No space left on device
+LOG: shutting down due to startup process failure
+```
+
+Two things address it, and both are needed:
+
+1. **Keepalive-driven advancement** (`cdc.rs`, "Keepalive-driven advancement").
+   We confirm up to the `walEnd` of primary keepalives, not just our last
+   decoded change, so a slot walks through WAL that holds nothing for it. Safe
+   because a logical walsender's `walEnd` is its own decoding position — see the
+   module docs for the walsender source that proves it. Guarded by the same
+   flush-before-promote ordering as everything else.
+2. **Concurrent mirrors** (Airflow `max_active_tasks=3`, no task dependencies).
+   Serialised tasks meant one slow mirror denied the others the chance to
+   acknowledge at all, which no amount of client-side cleverness can fix.
+
+`tests/test_slot_advance_unrelated_wal.sh` is the regression test: one row in the
+publication, a large volume of churn in a table outside it, and an assertion that
+the slot advances anyway.
+
+Note that `restart_lsn` moves in steps, not continuously — PostgreSQL only
+advances it when `candidate_restart_valid` is set while decoding an
+`XLOG_RUNNING_XACTS` record, so retention is released at those boundaries even
+when `confirmed_flush_lsn` is fully up to date.

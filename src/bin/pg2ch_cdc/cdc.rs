@@ -16,6 +16,9 @@
 //! - `last_decoded_lsn` — advanced the moment a WAL message is decoded into an
 //!   in-memory batch. Used for progress display and loop termination only.
 //!   **Never** sent to Postgres as written/flushed/applied.
+//! - `last_server_wal_end` — Postgres' own decoding position, learned from the
+//!   `walEnd` field of primary keepalive messages. Safe to treat as decoded:
+//!   see "Keepalive-driven advancement" below.
 //! - `last_durable_lsn` — advanced only after every batch has been successfully
 //!   flushed to ClickHouse. This is the only value ever reported to Postgres.
 //!
@@ -35,6 +38,39 @@
 //! seeded from wall-clock nanoseconds so a later run always outranks an earlier
 //! one, and readers (including pg2ch_diff) use `FINAL`. Duplicates collapse;
 //! gaps do not heal. Always err toward replay.
+//!
+//! ## Keepalive-driven advancement
+//!
+//! A slot cannot be recycled past what we confirm, and a naive client can only
+//! confirm as far as the last change it decoded *for its own publication*. When
+//! three mirrors share one busy database, each slot is dragged through the other
+//! two's write volume and pins all of it. We hit this on 2026-09-04: a ~850 GB
+//! burst on the ciq tables left the fds slot frozen, Postgres retained 2.1 TB of
+//! WAL, and the source filled its disk and PANICed.
+//!
+//! So we also confirm up to the `walEnd` carried by primary keepalives. This is
+//! safe, and the reason is in Postgres' own walsender:
+//!
+//! - `WalSndKeepalive()` sends `sentPtr` as `walEnd` (every call site but one
+//!   passes `InvalidXLogRecPtr`).
+//! - `XLogSendLogical()` assigns `sentPtr = reader->EndRecPtr` *after*
+//!   `LogicalDecodingProcessRecord()`, so every record at or below `walEnd` has
+//!   already been decoded and any output for our publication already written to
+//!   the stream.
+//! - The single call site passing a real LSN is `WalSndUpdateProgress()`, which
+//!   passes the end LSN of a transaction it *skipped* — also already processed.
+//!
+//! The connection is an ordered stream, so by the time we read a keepalive we
+//! have already read every data message below its `walEnd`. A transaction still
+//! in flight at `walEnd` commits at a higher LSN, so its commit stays above
+//! `confirmed_flush` and is replayed after a crash. `pg_recvlogical` does the
+//! same thing (`output_written_lsn = Max(walEnd, output_written_lsn)`), and
+//! pgjdbc adopted it in PR #1038.
+//!
+//! The flush-before-promote ordering is unchanged and still does the real work:
+//! every row we buffered came from a record at or below the decoder's position,
+//! so once the drain succeeds, `walEnd` is genuinely durable. If the drain fails
+//! we never promote.
 
 use anyhow::{bail, Context, Result};
 use std::collections::{HashMap, HashSet};
@@ -648,7 +684,10 @@ pub fn drain_cdc(cfg: &CdcConfig) -> Result<u64> {
         // flush fails we bail with `?` and never promote, so the next run
         // replays this window from the last successfully checkpointed position.
         if last_checkpoint.elapsed() > cfg.flush_interval {
-            let watermark = last_decoded_lsn;
+            // Include Postgres' decoding position: it lets the slot walk through
+            // WAL that holds nothing for this publication instead of pinning it.
+            // See "Keepalive-driven advancement" in the module docs.
+            let watermark = last_decoded_lsn.max(last_server_wal_end);
             for batch in batches.values_mut() {
                 batch.flush(&ch)?;
             }
@@ -887,7 +926,7 @@ pub fn drain_cdc(cfg: &CdcConfig) -> Result<u64> {
 
     // Every decoded row is now durable in ClickHouse — promote the watermark.
     last_durable_lsn = if last_decoded_lsn > 0 {
-        last_decoded_lsn
+        last_decoded_lsn.max(last_server_wal_end)
     } else {
         // We processed no WAL messages but the server scanned past our target
         // (all WAL was for other tables). Nothing to write, so the target is
