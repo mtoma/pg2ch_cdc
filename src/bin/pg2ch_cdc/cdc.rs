@@ -89,7 +89,7 @@ use pg2ch_cdc::types::{build_delete_row, tuple_to_strings};
 /// The `flushed` field is what advances the slot's `confirmed_flush_lsn` and
 /// permits Postgres to recycle WAL. Only ever pass `last_durable_lsn` here —
 /// see the module docs on the at-least-once contract.
-fn build_standby_status(lsn: u64) -> Vec<u8> {
+fn build_standby_status(lsn: u64, request_reply: bool) -> Vec<u8> {
     const PG_EPOCH_OFFSET: u64 = 946_684_800;
     let now_us = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -103,7 +103,10 @@ fn build_standby_status(lsn: u64) -> Vec<u8> {
     msg.extend_from_slice(&lsn.to_be_bytes()); // flushed
     msg.extend_from_slice(&lsn.to_be_bytes()); // applied
     msg.extend_from_slice(&now_us.to_be_bytes()); // client time
-    msg.push(0);
+    // Reply-requested byte. Setting it makes Postgres answer with a primary
+    // keepalive carrying its current decoding position, which is the only
+    // in-band way to learn that position — see "Keepalive-driven advancement".
+    msg.push(if request_reply { 1 } else { 0 });
     msg
 }
 
@@ -642,7 +645,7 @@ pub fn drain_cdc(cfg: &CdcConfig) -> Result<u64> {
                     // Reply with our durable LSN (never the server's position, and
                     // never the decoded position — see the module docs).
                     if reply_requested {
-                        conn.put_copy_data(&build_standby_status(last_durable_lsn))
+                        conn.put_copy_data(&build_standby_status(last_durable_lsn, false))
                             .context("Failed to send standby status")?;
                         conn.flush().context("Failed to flush standby status")?;
                     }
@@ -693,7 +696,7 @@ pub fn drain_cdc(cfg: &CdcConfig) -> Result<u64> {
             }
             last_durable_lsn = watermark;
 
-            conn.put_copy_data(&build_standby_status(last_durable_lsn))
+            conn.put_copy_data(&build_standby_status(last_durable_lsn, false))
                 .context("Failed to send checkpoint standby status")?;
             conn.flush().context("Failed to flush checkpoint standby status")?;
             debug!("Checkpoint: durable through {}", format_lsn(last_durable_lsn));
@@ -711,7 +714,15 @@ pub fn drain_cdc(cfg: &CdcConfig) -> Result<u64> {
         // as proof of life without advancing the slot — which is exactly right:
         // we are alive, but nothing new is durable yet.
         if last_feedback.elapsed() > Duration::from_secs(10) {
-            conn.put_copy_data(&build_standby_status(last_durable_lsn))
+            // request_reply = true. Without it Postgres never sends us a
+            // keepalive during an active stream: WalSndKeepaliveIfNecessary()
+            // only fires after half of wal_sender_timeout WITHOUT a reply, and
+            // this very message resets that timer. So a slot scanning WAL that
+            // holds nothing for its publication would learn nothing of the
+            // server's progress and could not advance — measured in production
+            // on 2026-09-04, where pg2ch_ciq scanned 1.3 TB with 0 rows applied
+            // and confirmed_flush_lsn stayed frozen for ~55 minutes.
+            conn.put_copy_data(&build_standby_status(last_durable_lsn, true))
                 .context("Failed to send proactive standby status")?;
             conn.flush().context("Failed to flush proactive standby status")?;
             last_feedback = Instant::now();
@@ -935,7 +946,7 @@ pub fn drain_cdc(cfg: &CdcConfig) -> Result<u64> {
     };
 
     // ── 6. Confirm the LSN we made durable ──────────────────────────────
-    conn.put_copy_data(&build_standby_status(last_durable_lsn))
+    conn.put_copy_data(&build_standby_status(last_durable_lsn, false))
         .context("Failed to send final standby status")?;
     conn.flush().context("Failed to flush final standby status")?;
     info!("Confirmed LSN: {}", format_lsn(last_durable_lsn));
