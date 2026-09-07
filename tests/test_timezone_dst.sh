@@ -46,7 +46,7 @@ write_config() {
     # write_config <path> <timezone>
     cat > "$1" <<EOF
 mirror_name: $MIRROR_NAME
-timezone: $2
+store_naive_timestamps_as_timezone: $2
 
 source:
   host: $TEST_PG_HOST
@@ -221,7 +221,7 @@ echo "=== pg2ch_diff must agree ==="
 DIFF_CONFIG=$(mktemp /tmp/test_tz_diff_XXXXXX.yaml)
 cat > "$DIFF_CONFIG" <<EOF
 mirror_name: $MIRROR_NAME
-timezone: UTC
+store_naive_timestamps_as_timezone: UTC
 
 source:
   host: $TEST_PG_HOST

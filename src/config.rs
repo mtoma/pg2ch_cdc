@@ -7,11 +7,20 @@ use std::path::Path;
 #[derive(Debug, Deserialize)]
 pub struct MirrorConfig {
     pub mirror_name: String,
-    /// Timezone the mirror stores timestamps in. **Mandatory** — see
-    /// `validate_timezone` for why there is no safe default.
-    #[serde(default)]
-    pub timezone: String,
-    /// Opt in to a DST-observing `timezone:`, accepting that PostgreSQL values
+    /// Timezone that PostgreSQL's naive `timestamp` (OID 1114) values are
+    /// stored in. Defaults to UTC, which is the only sensible default: it is
+    /// the choice under which every wall clock round-trips.
+    ///
+    /// Accepts the old name `timezone:` as an alias so existing configs keep
+    /// working. Set it explicitly to the value a pre-existing mirror is
+    /// already on, or its tables migrate to UTC the next time each is loaded.
+    ///
+    /// This governs *created* tables. It says nothing about `timestamptz`
+    /// (OID 1184), which the initial load cannot handle at any value — see the
+    /// KNOWN LIMITATION note at the load path in orchestrator.rs.
+    #[serde(default = "default_naive_timestamp_timezone", alias = "timezone")]
+    pub store_naive_timestamps_as_timezone: String,
+    /// Opt in to a DST-observing timezone, accepting that PostgreSQL values
     /// in the spring-forward gap cannot be stored faithfully.
     ///
     /// Exists for mirrors that already hold data on a DST timezone, where
@@ -27,14 +36,14 @@ pub struct MirrorConfig {
     pub tables: Vec<String>,
 }
 
-/// Reject a missing or DST-observing `timezone:` at config-load time.
+/// Reject an explicitly-empty timezone at config-load time.
 ///
 /// PostgreSQL `timestamp` carries no timezone; ClickHouse `DateTime64` is
 /// always an instant plus a display timezone. Something has to say which
-/// timezone the wall clocks are in, and the only two candidates are this
-/// setting or the ClickHouse server's own default — which is invisible in the
-/// config, differs between deployments, and silently changes the meaning of
-/// stored data if it is ever altered. So we require it here.
+/// timezone the wall clocks are in, and the alternative to this setting is the
+/// ClickHouse server's own default — invisible in the config, different between
+/// deployments, and silently changing the meaning of stored data if altered.
+/// So the setting always has a value: absent means UTC, never "the server's".
 ///
 /// The value must not observe DST. In a zone that springs forward, one hour a
 /// year does not exist, so the naive PostgreSQL values inside it cannot be
@@ -44,19 +53,23 @@ pub struct MirrorConfig {
 pub fn validate_timezone(tz: &str) -> Result<()> {
     if tz.trim().is_empty() {
         anyhow::bail!(
-            "Missing mandatory `timezone:` setting.\n\n\
-             PostgreSQL `timestamp` values carry no timezone, but every ClickHouse\n\
-             DateTime64 column is an instant plus a display timezone. The mirror must\n\
-             be told which timezone your naive timestamps are in — it is not safe to\n\
-             inherit it from the ClickHouse server, because that default is invisible\n\
-             here and changing it silently reinterprets all stored data.\n\n\
-             Add to the mirror config:\n\n    timezone: UTC\n\n\
-             Use UTC unless you have a specific reason not to. A zone that observes\n\
-             DST cannot represent one hour per year and is rejected."
+            "`store_naive_timestamps_as_timezone:` is set but empty.\n\n\
+             Either remove the key entirely — it defaults to UTC, which is the value\n\
+             under which every PostgreSQL wall clock round-trips — or name a\n\
+             timezone. An empty string would fall back to the ClickHouse server's\n\
+             own default, which is invisible from this config, differs between\n\
+             deployments, and silently reinterprets stored data if it is changed.\n\n\
+             For a mirror that ALREADY holds data, set this to the timezone that\n\
+             data is on, or its tables migrate the next time each one is loaded.\n\n\
+             A zone that observes DST cannot represent one hour per year and is\n\
+             rejected unless `timezone_allow_dst: true` is also set."
         );
     }
     if tz != tz.trim() {
-        anyhow::bail!("`timezone:` must not have leading or trailing whitespace: {:?}", tz);
+        anyhow::bail!(
+            "`store_naive_timestamps_as_timezone:` must not have leading or trailing whitespace: {:?}",
+            tz
+        );
     }
     Ok(())
 }
@@ -109,6 +122,7 @@ impl Default for Settings {
     }
 }
 
+pub fn default_naive_timestamp_timezone() -> String { "UTC".to_string() }
 fn default_pg_port() -> u16 { 5432 }
 fn default_ch_port() -> u16 { 8123 }
 fn default_batch_size() -> usize { 100_000 }
@@ -126,7 +140,7 @@ impl MirrorConfig {
         if config.tables.is_empty() {
             anyhow::bail!("No tables specified in config file: {}", path.display());
         }
-        validate_timezone(&config.timezone)
+        validate_timezone(&config.store_naive_timestamps_as_timezone)
             .with_context(|| format!("In config file: {}", path.display()))?;
 
         Ok(config)

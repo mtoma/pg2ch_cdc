@@ -32,11 +32,11 @@ pub fn run_mirror(config: &MirrorConfig) -> Result<()> {
     let pg = PgClient::connect(&src.host, src.port, &src.database, &src.user, &src.password)?;
     let ch = ChClient::new(
         &dst.host, dst.port, &dst.user, &dst.password,
-        config.settings.ch_timeout_secs, &config.timezone,
+        config.settings.ch_timeout_secs, &config.store_naive_timestamps_as_timezone,
     );
 
     // ── Validate the configured timezone against ClickHouse ─────────────
-    validate_timezone_in_ch(&ch, &config.timezone, config.timezone_allow_dst)?;
+    validate_timezone_in_ch(&ch, &config.store_naive_timestamps_as_timezone, config.timezone_allow_dst)?;
     // The server default is what an unpinned DateTime column is stored on,
     // so we need it to judge pre-existing tables.
     let ch_server_tz = ch
@@ -245,10 +245,10 @@ pub fn run_mirror(config: &MirrorConfig) -> Result<()> {
         // convention from the config is legitimate — that is how an
         // incremental migration looks midway through.
         let table_timezone = if ch_table_exists {
-            resolve_table_timezone(&ch, &ch_table, &config.timezone, &ch_server_tz)?
+            resolve_table_timezone(&ch, &ch_table, &config.store_naive_timestamps_as_timezone, &ch_server_tz)?
         } else {
             // Created below with the configured timezone.
-            Some(config.timezone.clone())
+            Some(config.store_naive_timestamps_as_timezone.clone())
         };
 
         let pg_est_rows = pg.query(&format!(
@@ -409,10 +409,13 @@ pub fn run_mirror(config: &MirrorConfig) -> Result<()> {
         // drop + recreate to match the latest PG schema. Safe because the
         // table is either empty (LOAD) or about to be wiped (RELOAD).
         let (ch_db, ch_tbl) = ch_table.split_once('.').unwrap_or(("default", &ch_table));
+        // TabSeparatedRaw, not TabSeparated: the latter escapes the quotes inside
+        // a timezone-qualified type, yielding Nullable(DateTime64(6, \'UTC\'))
+        // which can never compare equal to anything we construct.
         let ch_schema_raw = ch.query(&format!(
             "SELECT name, type FROM system.columns \
              WHERE database='{}' AND table='{}' AND name NOT LIKE '_pg2ch_%' \
-             ORDER BY position FORMAT TabSeparated",
+             ORDER BY position FORMAT TabSeparatedRaw",
             ch_db, ch_tbl
         ))?;
         let ch_schema: Vec<(String, String)> = ch_schema_raw.lines()
@@ -427,11 +430,19 @@ pub fn run_mirror(config: &MirrorConfig) -> Result<()> {
             "DESCRIBE TABLE postgresql('{}:{}', '{}', '{}', '{}', '{}', '{}') FORMAT TabSeparated",
             src.host, src.port, src.database, ti.table, src.user, src.password, src.schema
         ))?;
+        // Normalise the DESCRIBE side exactly as create_ch_table does before
+        // issuing the CREATE, or the comparison is rigged: DESCRIBE always
+        // returns a BARE DateTime64(p) (no setting changes that), while the
+        // table we built from it carries the configured timezone. Comparing
+        // the two raw reports drift on every pinned table forever, which both
+        // destroys real drift detection and silently reverts the timezone.
         let pg_schema: Vec<(String, String)> = pg_schema_raw.lines()
             .filter(|l| !l.is_empty())
             .filter_map(|line| {
                 let mut p = line.split('\t');
-                Some((p.next()?.to_string(), p.next()?.to_string()))
+                let name = p.next()?.to_string();
+                let ty = pin_datetime_timezone(p.next()?, &config.store_naive_timestamps_as_timezone);
+                Some((name, ty))
             })
             .collect();
 
@@ -507,7 +518,7 @@ pub fn run_mirror(config: &MirrorConfig) -> Result<()> {
             let dst_port = dst.port;
             let dst_user = dst.user.clone();
             let dst_password = dst.password.clone();
-            let dst_timezone = config.timezone.clone();
+            let dst_timezone = config.store_naive_timestamps_as_timezone.clone();
             let ch_timeout = config.settings.ch_timeout_secs;
 
             handles.push(std::thread::spawn(move || {
@@ -523,11 +534,11 @@ pub fn run_mirror(config: &MirrorConfig) -> Result<()> {
                         Some(item) => item,
                         None => break,
                     };
-
                     // The load resolves naive PG timestamps once for the whole
-                    // INSERT, so it needs one unambiguous timezone. Only this
-                    // table is skipped; the rest of the mirror is unaffected.
-                    let Some(table_tz) = table_tz else {
+                    // INSERT, so it needs one unambiguous timezone. A table whose
+                    // DateTime columns disagree with each other has none, and is
+                    // skipped — only this table; the rest of the mirror is fine.
+                    if table_tz.is_none() {
                         let msg = format!(
                             "{}: cannot initial-load a table whose DateTime columns declare \
                              different timezones — migrate them together first",
@@ -536,7 +547,17 @@ pub fn run_mirror(config: &MirrorConfig) -> Result<()> {
                         error!("[W{}] {}", worker_id, msg);
                         errors.lock().unwrap().push(msg);
                         continue;
-                    };
+                    }
+
+                    // Use the CONFIGURED timezone, not the one captured before the
+                    // create/reload loop ran. That loop may have dropped and recreated
+                    // this table with the configured value, and loading with the
+                    // pre-recreate value writes every row an offset out — it corrupted
+                    // ciqfininstancedateunc (4.7M rows, every one wrong) on 2026-09-07.
+                    // Safe because the drift check now normalises both sides, so a table
+                    // disagreeing with the config is always recreated before it is
+                    // loaded: the configured value IS this table's value here.
+                    let table_tz = dst_timezone.clone();
 
                     // Get column names
                     let col_response = match ch.query(&format!(
@@ -571,6 +592,39 @@ pub fn run_mirror(config: &MirrorConfig) -> Result<()> {
                     // declared timezone), postgresql() resolves naive timestamps once
                     // per request, and the resulting instant is merely copied into the
                     // column. A query-level SETTINGS overrides the client-wide default.
+                    //
+                    // KNOWN LIMITATION — PostgreSQL `timestamptz` (OID 1184) cannot be
+                    // loaded correctly by this path at any session_timezone.
+                    // ClickHouse/ClickHouse#89128: the postgresql() reader parses the
+                    // output of `COPY (SELECT ...) TO STDOUT` and DISCARDS the offset, so
+                    // `1999-12-31 19:00:00-05` is read as the naive `19:00:00` and then
+                    // localised into session_timezone. Declaring the target column
+                    // `DateTime64(p,'UTC')` does not help — the offset is already gone
+                    // before the column type is consulted. Measured on 26.4.2.10: a PG
+                    // value whose true instant is 1788535905 read back as 1788543104
+                    // under session_timezone='UTC' (out by the PG server's +02 offset),
+                    // and correctly only when session_timezone happened to equal the PG
+                    // server's TimeZone.
+                    //
+                    // The CDC path is NOT affected: pgoutput hands us PG's text with the
+                    // offset intact and `date_time_input_format=best_effort` honours it,
+                    // which is the same thing the issue recommends as a workaround. So an
+                    // initial load and CDC would write DIFFERENT instants into the same
+                    // 1184 column — old rows wrong, new rows right, nothing flagging it.
+                    //
+                    // Harmless today: every one of the 1,016 timestamp columns in the
+                    // mirrored schemas is `timestamp without time zone` (OID 1114), and
+                    // 1114 is exactly what session_timezone is here to resolve. It would
+                    // bite the first time a `timestamptz` column appears in a mirrored
+                    // table. The fixes, in increasing order of cost:
+                    //   - ClickHouse >= 26.7 accepts a pass-through query, so the load can
+                    //     cast 1184 to text in PG and parse it here explicitly:
+                    //     postgresql(..., query('SELECT ts::text ... '), ...) then
+                    //     parseDateTimeBestEffort(ts, 'UTC'). Verified unavailable on 26.4.
+                    //   - On 26.4, the same via `CREATE TABLE ... ENGINE = PostgreSQL`
+                    //     with the 1184 columns declared String. Verified to work,
+                    //     including under a deliberately mismatched session_timezone.
+                    // See .claude/rules/timezones.md, "timestamptz on the load path".
                     let insert = format!(
                         "INSERT INTO {} ({}, _pg2ch_rel_id, _pg2ch_synced_at, _pg2ch_is_deleted, _pg2ch_version) \
                          SELECT *, {}, now64(), 0, 0 FROM postgresql('{}:{}', '{}', '{}', '{}', '{}', '{}') \
@@ -681,7 +735,7 @@ pub fn run_mirror(config: &MirrorConfig) -> Result<()> {
         .map(|t| (t.clone(), config.ch_table_name(t)))
         .collect();
     let cfg = CdcConfig {
-        timezone: config.timezone.clone(),
+        timezone: config.store_naive_timestamps_as_timezone.clone(),
         pg_host: src.host.clone(),
         pg_port: src.port,
         pg_user: src.user.clone(),
@@ -929,7 +983,7 @@ fn create_ch_table(
         src.host, src.port, src.database, table, src.user, src.password, src.schema
     ))?;
 
-    let tz = &config.timezone;
+    let tz = &config.store_naive_timestamps_as_timezone;
     let mut col_defs: Vec<String> = Vec::new();
     for line in describe.lines() {
         if line.trim().is_empty() { continue; }

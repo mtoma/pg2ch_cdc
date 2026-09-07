@@ -1,12 +1,42 @@
 # Timezones
 
-`timezone:` is mandatory in every mirror and diff config. There is no default,
-and adding one would reintroduce the bug the setting exists to prevent.
+`store_naive_timestamps_as_timezone:` (old name `timezone:`, still accepted)
+sets the timezone that PostgreSQL's naive `timestamp` (OID 1114) values are
+stored in. It **defaults to UTC** — the only value under which every wall clock
+round-trips. Absent means UTC, never "whatever the ClickHouse server is set to".
 
-It sets the timezone for **newly created** tables and for pinning columns that
-never declared one. For a table that already declares a timezone, **the column
-type wins** — see "The column type is the authority" below. That is deliberate:
-it lets a mirror be migrated one table at a time.
+It governs **created** tables. A pre-existing mirror should set it explicitly to
+the timezone its data is already on, or each table migrates the next time it is
+loaded.
+
+There is no such thing as a table timezone in either PostgreSQL or ClickHouse —
+it is a **column type parameter** in ClickHouse and a session GUC in PostgreSQL,
+and one ClickHouse table may legally hold columns on different timezones. The
+tool derives one value per table only because the initial load is a single
+`INSERT … SELECT * FROM postgresql(…)` carrying a single `session_timezone`.
+
+## timestamptz on the load path — a known limitation
+
+`timestamptz` (OID 1184) **cannot be loaded correctly by `postgresql()` at any
+`session_timezone`.** ClickHouse/ClickHouse#89128: the reader parses the output
+of `COPY (SELECT …) TO STDOUT` and discards the offset, so `19:00:00-05` is read
+as the naive `19:00:00` and then localised. Declaring the target column
+`DateTime64(p,'UTC')` does not help — the offset is gone before the column type
+is consulted. Measured on 26.4.2.10: a value whose true instant was 1788535905
+read back as 1788543104 under `session_timezone='UTC'`.
+
+The CDC path is unaffected: pgoutput hands us PG's text with the offset intact
+and `date_time_input_format=best_effort` honours it — the same thing the issue
+recommends as a workaround. So for a 1184 column an initial load and CDC would
+write *different* instants into the same column, with nothing flagging it.
+
+Harmless today: all 1,016 timestamp columns in the mirrored schemas are 1114.
+Fixes, cheapest first:
+- ClickHouse >= 26.7 accepts a pass-through query (PR #107740), so the load can
+  cast to text in PG and parse here: `postgresql(…, query('SELECT ts::text …'),
+  …)` then `parseDateTimeBestEffort(ts,'UTC')`. Verified unavailable on 26.4.
+- On 26.4, the same via `CREATE TABLE … ENGINE = PostgreSQL` with those columns
+  declared `String`. Verified to work, including under a mismatched session.
 
 ## The type mismatch this resolves
 
@@ -70,6 +100,28 @@ the defect and continues, warning on every run.
 It is deliberately awkward: no default, has to be written into the config, and
 prints a ten-line warning each run. Do not set it for a new mirror — there is
 no reason to choose a lossy convention from scratch.
+
+## Why the drift check must normalise both sides
+
+`DESCRIBE TABLE postgresql()` always returns a **bare** `DateTime64(p)` — no
+setting changes that, `session_timezone` included. The table we build from it
+carries the configured timezone, because `create_ch_table` pins it. So the
+load path's name-and-type drift comparison is between *our edited copy of
+DESCRIBE's output* and *DESCRIBE's output*, and reports drift forever.
+
+That did real damage on 2026-09-07. Every pinned table entering a load was
+dropped and recreated, which (a) made genuine drift detection useless and
+(b) discarded the timezone. Worse, the loader used a timezone captured *before*
+that recreate, so naive wall clocks were parsed in one zone and stored in a
+column declaring another — corrupting all 4.7M rows of
+`ciqfininstancedateunc`, not merely its 75 DST-gap rows.
+
+Both sides are now normalised through `pin_datetime_timezone` with the
+configured value, and `system.columns` is read as `TabSeparatedRaw` (plain
+`TabSeparated` escapes the quotes, so the strings could not match even once
+normalised). The loader uses the configured value too, which is safe precisely
+because a table disagreeing with it is always recreated before being loaded.
+`tests/test_timezone_migration.sh` covers both defects.
 
 ## The column type is the authority
 

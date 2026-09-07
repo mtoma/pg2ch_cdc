@@ -541,7 +541,7 @@ mod tests {
         use crate::config::validate_timezone;
         // Missing is an error, and the message has to say what to add.
         let err = validate_timezone("").unwrap_err().to_string();
-        assert!(err.contains("timezone: UTC"), "unhelpful message: {err}");
+        assert!(err.contains("defaults to UTC"), "unhelpful message: {err}");
         assert!(validate_timezone(" UTC").is_err());
         assert!(validate_timezone("UTC").is_ok());
         // DST rejection needs ClickHouse's timezone database, so it lives in

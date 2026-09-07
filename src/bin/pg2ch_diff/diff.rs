@@ -37,7 +37,7 @@ pub fn run_diff(config: &DiffConfig, skip_snapshot: bool, keep_snapshot: bool) -
     let dst = &config.destination;
 
     let pg = PgClient::connect(&src.host, src.port, &src.database, &src.user, &src.password)?;
-    let ch = ChClient::new(&dst.host, dst.port, &dst.user, &dst.password, config.ch_timeout_secs, &config.timezone);
+    let ch = ChClient::new(&dst.host, dst.port, &dst.user, &dst.password, config.ch_timeout_secs, &config.store_naive_timestamps_as_timezone);
 
     let mut results: Vec<TableResult> = Vec::new();
 
@@ -347,7 +347,7 @@ fn diff_table(
         // Spawn progress monitor thread
         let snap_table_clone = snapshot_table.clone();
         let dst = &config.destination;
-        let monitor_ch = ChClient::new(&dst.host, dst.port, &dst.user, &dst.password, 60, &config.timezone);
+        let monitor_ch = ChClient::new(&dst.host, dst.port, &dst.user, &dst.password, 60, &config.store_naive_timestamps_as_timezone);
         let pg_est_for_monitor = pg_est_count;
         let stop_monitor = Arc::new(AtomicBool::new(false));
         let stop_flag = stop_monitor.clone();
@@ -386,7 +386,7 @@ fn diff_table(
         // snapshot lands an offset away and the diff reports mismatches that
         // are entirely its own doing.
         let snapshot_tz = datetime_timezone(&data_columns)
-            .unwrap_or_else(|| config.timezone.clone());
+            .unwrap_or_else(|| config.store_naive_timestamps_as_timezone.clone());
         ch.query(&format!(
             "INSERT INTO {} SELECT * FROM {} SETTINGS session_timezone = '{}'",
             snapshot_table, pg_func, snapshot_tz

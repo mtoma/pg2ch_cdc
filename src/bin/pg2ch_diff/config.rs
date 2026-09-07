@@ -13,8 +13,8 @@ pub struct DiffConfig {
     /// the CDC mirror config: the diff snapshots PostgreSQL into ClickHouse via
     /// postgresql(), so a wrong value here makes the comparison itself resolve
     /// naive timestamps differently from the mirror and report false diffs.
-    #[serde(default)]
-    pub timezone: String,
+    #[serde(default = "pg2ch_cdc::config::default_naive_timestamp_timezone", alias = "timezone")]
+    pub store_naive_timestamps_as_timezone: String,
     pub source: pg2ch_cdc::config::SourceConfig,
     pub destination: pg2ch_cdc::config::DestinationConfig,
     /// CH database for temporary snapshot tables (defaults to destination database)
@@ -74,7 +74,7 @@ impl DiffConfig {
         if config.tables.is_empty() {
             anyhow::bail!("No tables specified in diff config: {}", path.display());
         }
-        pg2ch_cdc::config::validate_timezone(&config.timezone)
+        pg2ch_cdc::config::validate_timezone(&config.store_naive_timestamps_as_timezone)
             .with_context(|| format!("In diff config: {}", path.display()))?;
         Ok(config)
     }

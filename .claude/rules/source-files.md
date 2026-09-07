@@ -26,7 +26,7 @@ One file per mirror in `mirrors/`. Example:
 
 ```yaml
 mirror_name: cstat     # used for publication/slot naming: pg2ch_cstat
-timezone: UTC          # REQUIRED — timezone timestamps are stored in
+store_naive_timestamps_as_timezone: UTC   # defaults to UTC
 
 source:
   host: pg-host

@@ -37,7 +37,7 @@ Create a YAML config in `mirrors/`:
 
 ```yaml
 mirror_name: my_mirror
-timezone: UTC                # REQUIRED — see "Timestamps and timezones" below
+store_naive_timestamps_as_timezone: UTC   # defaults to UTC; see "Timestamps and timezones"
 
 source:
   host: pg-host
@@ -336,7 +336,7 @@ Diff configs live in `diffs/`. They reuse the same source/destination format as 
 
 ```yaml
 mirror_name: my_mirror
-timezone: UTC                # REQUIRED — must match the mirror config
+store_naive_timestamps_as_timezone: UTC   # must match the mirror config
 
 source:
   host: pg-host

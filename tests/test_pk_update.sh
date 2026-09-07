@@ -74,7 +74,7 @@ echo "=== Writing mirror config ==="
 MIRROR_CONFIG=$(mktemp /tmp/test_pk_update_XXXXXX.yaml)
 cat > "$MIRROR_CONFIG" <<EOF
 mirror_name: $MIRROR_NAME
-timezone: UTC
+store_naive_timestamps_as_timezone: UTC
 
 source:
   host: $TEST_PG_HOST
@@ -188,7 +188,7 @@ echo "=== Running diff ==="
 DIFF_CONFIG=$(mktemp /tmp/test_pk_update_diff_XXXXXX.yaml)
 cat > "$DIFF_CONFIG" <<EOF
 mirror_name: $MIRROR_NAME
-timezone: UTC
+store_naive_timestamps_as_timezone: UTC
 
 source:
   host: $TEST_PG_HOST
