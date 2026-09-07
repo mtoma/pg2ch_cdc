@@ -290,13 +290,27 @@ fi
 echo "$OUT" | grep -qi "does not recognise timezone" || fail "unknown-timezone message unclear: $OUT"
 echo "refused"
 
-echo "=== A missing timezone must be refused ==="
-grep -v '^timezone:' "$MIRROR_CONFIG" > "$BAD_CONFIG"
+echo "=== An ABSENT timezone must default to UTC, not to the server's ==="
+# The whole point of the setting: absent means UTC, never "whatever the
+# ClickHouse server happens to be set to". The table here is already on UTC, so
+# the default matches it and the run is a no-op.
+grep -v '^store_naive_timestamps_as_timezone:' "$MIRROR_CONFIG" > "$BAD_CONFIG"
+OUT=$("$BIN_DIR/pg2ch_cdc" --config "$BAD_CONFIG" --plain 2>&1) \
+    || { echo "$OUT" | tail -5; fail "a config with no timezone key was refused; it should default to UTC"; }
+echo "$OUT" | grep -qE "Timezone: UTC" \
+    || fail "an absent key did not default to UTC: $OUT"
+echo "$(ch_query "SELECT type FROM system.columns WHERE database='$CH_DATABASE' AND table='events' AND name='naive_ts' FORMAT TabSeparatedRaw")" \
+    | grep -q "'UTC'" || fail "an absent key changed the column timezone"
+compare_all "with an absent timezone key"
+echo "defaulted to UTC and changed nothing"
+
+echo "=== An EXPLICITLY EMPTY timezone must be refused ==="
+sed 's/^store_naive_timestamps_as_timezone:.*/store_naive_timestamps_as_timezone: ""/' "$MIRROR_CONFIG" > "$BAD_CONFIG"
 if OUT=$("$BIN_DIR/pg2ch_cdc" --config "$BAD_CONFIG" --plain 2>&1); then
-    fail "a config with no timezone: was accepted"
+    fail "an empty timezone value was accepted"
 fi
-echo "$OUT" | grep -q "timezone: UTC" || fail "missing-timezone message does not say what to add: $OUT"
-echo "refused, and the message says what to add"
+echo "$OUT" | grep -q "defaults to UTC" || fail "empty-value message unclear: $OUT"
+echo "refused, and the message says to remove the key or name a zone"
 
 echo "=== A config timezone that disagrees with the table must NOT override it ==="
 # The table is stored on UTC. Pointing a config at a different (DST-free)
