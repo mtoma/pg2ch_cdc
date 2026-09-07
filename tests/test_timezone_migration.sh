@@ -92,6 +92,15 @@ compare_all() {
     echo "  $phase: all rows match PostgreSQL"
 }
 
+# The table's full contents, for before/after stability checks. Used where the
+# column is on a DST timezone and therefore CANNOT match PostgreSQL — there the
+# question is whether a re-run left the table alone, not whether it is correct.
+snapshot() {
+    ch_query "SELECT id, ifNull(toString(naive_ts),'~NULL~')
+              FROM $CH_DATABASE.events FINAL WHERE _pg2ch_is_deleted = 0
+              ORDER BY id FORMAT TabSeparatedRaw"
+}
+
 declared_tz() {
     ch_query "SELECT type FROM system.columns WHERE database='$CH_DATABASE' AND table='events' AND name='naive_ts' FORMAT TabSeparatedRaw"
 }
@@ -127,10 +136,16 @@ GAP=$(ch_query "SELECT count() FROM $CH_DATABASE.events WHERE substring(toString
 echo "  confirmed: the gap row is lost under Europe/Paris (renders 0 rows at 02:xx)"
 
 echo "=== Phase 2: re-running must NOT recreate the table (defect 1) ==="
+# NOTE: no compare_all here. The column is still on Europe/Paris, so the gap row
+# genuinely cannot match PostgreSQL — that is the defect under test, not a
+# regression. What must hold is that a second run changes nothing at all.
+BEFORE=$(snapshot)
 OUT=$("$BIN_DIR/pg2ch_cdc" --config "$PARIS_CFG" --plain 2>&1)
 echo "$OUT" | grep -qi "Schema drift" && { echo "$OUT" | grep -i "schema drift"; fail "spurious schema drift on an unchanged table"; }
 echo "$(declared_tz)" | grep -q "Europe/Paris" || fail "an unchanged run altered the timezone"
-compare_all "phase 2 (unchanged)"
+AFTER=$(snapshot)
+[ "$BEFORE" = "$AFTER" ] || { diff <(echo "$BEFORE") <(echo "$AFTER") | head -10; fail "a no-op run altered the table contents"; }
+echo "  phase 2: table untouched by a second run (no drift, same timezone, same rows)"
 
 echo "=== Phase 3: migrate by dropping the table, with the config now on UTC ==="
 ch_query "DROP TABLE $CH_DATABASE.events SYNC"
