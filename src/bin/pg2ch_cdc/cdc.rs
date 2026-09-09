@@ -541,6 +541,27 @@ pub fn drain_cdc(cfg: &CdcConfig) -> Result<u64> {
     // CURRENT remaining distance.
     let mut cdc_rate_history: Vec<f64> = Vec::new();
 
+    // Open transaction, for explaining a frozen LSN.
+    //
+    // Postgres only replays a transaction to the output plugin once it has read
+    // that transaction's COMMIT record, and every change it sends carries an LSN
+    // below the commit. So while one large transaction is being delivered, the
+    // LSN legitimately cannot advance however fast rows are arriving — the ETA,
+    // which is computed from LSN distance, has nothing to work with.
+    //
+    // Reporting that as "stalled" is wrong and sent one investigation down the
+    // wrong path: a 610M-row reload of ciqpriceequity showed "91.7%, ETA
+    // stalled" for two hours while ClickHouse was taking 75k rows/s. The BEGIN
+    // message carries the transaction's commit LSN, so we can say exactly what
+    // is happening and where the LSN will jump to when it lands.
+    struct OpenXact {
+        xid: u32,
+        commit_lsn: u64,
+        msgs_at_begin: u64,
+    }
+    let mut open_xact: Option<OpenXact> = None;
+    let mut msgs_at_last_progress: u64 = 0;
+
     let _reached_target;
 
     loop {
@@ -578,6 +599,20 @@ pub fn drain_cdc(cfg: &CdcConfig) -> Result<u64> {
 
                     match decode_pgoutput(payload) {
                         Some(msg) => {
+                            // Track transaction boundaries before handing the
+                            // message on, so a frozen LSN can be explained
+                            // rather than reported as a stall.
+                            match &msg {
+                                PgoutputMessage::Begin { xid, final_lsn, .. } => {
+                                    open_xact = Some(OpenXact {
+                                        xid: *xid,
+                                        commit_lsn: *final_lsn,
+                                        msgs_at_begin: total_wal_msgs,
+                                    });
+                                }
+                                PgoutputMessage::Commit => open_xact = None,
+                                _ => {}
+                            }
                             process_message(msg, &mut relations, &mut rel_to_table, &mut batches, &expected_oids, &mut stale_rel_ids, &mut skipped_counts)?;
                         }
                         None => {
@@ -820,8 +855,39 @@ pub fn drain_cdc(cfg: &CdcConfig) -> Result<u64> {
                     };
                     format!(", ETA {}{}", format_duration(eta_secs), bounds_str)
                 } else if span >= 30.0 && progressed == 0.0 && remaining > 0.0 {
-                    // No progress in the whole window — be honest, don't guess.
-                    ", ETA stalled".to_string()
+                    // The LSN has not moved in the whole window. That has two
+                    // completely different causes and they must not read alike.
+                    let msgs_since = total_wal_msgs.saturating_sub(msgs_at_last_progress);
+                    match &open_xact {
+                        Some(x) if msgs_since > 0 => {
+                            // Rows are flowing; the LSN is pinned below this
+                            // transaction's commit record by design.
+                            format!(
+                                ", ETA n/a — inside txn {} ({:.1}k msgs so far, commits at {}); \
+                                 LSN cannot advance until then",
+                                x.xid,
+                                total_wal_msgs.saturating_sub(x.msgs_at_begin) as f64 / 1000.0,
+                                format_lsn(x.commit_lsn)
+                            )
+                        }
+                        Some(x) => {
+                            // In a transaction but nothing arriving: Postgres is
+                            // still reading/spilling it server-side.
+                            format!(
+                                ", ETA n/a — inside txn {} (commits at {}), no rows arriving: \
+                                 Postgres is still decoding it server-side",
+                                x.xid,
+                                format_lsn(x.commit_lsn)
+                            )
+                        }
+                        None if msgs_since > 0 => {
+                            // Between transactions, messages arriving but none
+                            // advancing the LSN toward target — WAL for tables
+                            // outside our publication.
+                            ", ETA n/a — receiving WAL that holds nothing for this publication".to_string()
+                        }
+                        None => ", ETA stalled — no WAL arriving from Postgres".to_string(),
+                    }
                 } else {
                     String::new()
                 }
@@ -909,6 +975,7 @@ pub fn drain_cdc(cfg: &CdcConfig) -> Result<u64> {
             }
 
             last_progress = Instant::now();
+            msgs_at_last_progress = total_wal_msgs;
         }
 
         // Check termination: have we decoded up to the target? Durability is
