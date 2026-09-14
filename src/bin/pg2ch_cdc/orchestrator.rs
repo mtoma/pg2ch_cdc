@@ -721,6 +721,23 @@ pub fn run_mirror(config: &MirrorConfig) -> Result<()> {
                         let mon_est = pg_rows_est;
                         let mon_start = Instant::now();
                         Some(std::thread::spawn(move || {
+                            // Rate over a sliding window, not a cumulative average.
+                            //
+                            // `loaded / elapsed` is the average since the load began,
+                            // and a load's rate is not constant: ciqestimatenumericdata
+                            // on 2026-09-14 ramped from 109k to 535k rows/s over its
+                            // first hour, then plateaued. A cumulative average can only
+                            // crawl toward the truth from below — it read 310k/s while
+                            // the table was actually taking 519k/s — and it RISES while
+                            // throughput falls, which is the opposite of what a rate is
+                            // for. It also cannot track the decline at the end.
+                            //
+                            // The CDC path already uses a sliding window for this. This
+                            // one predates it.
+                            const WINDOW: Duration = Duration::from_secs(300);
+                            let mut samples: std::collections::VecDeque<(Instant, u64)> =
+                                std::collections::VecDeque::new();
+
                             std::thread::sleep(Duration::from_secs(60)); // first check after 1 min
                             while !stop.load(Ordering::Relaxed) {
                                 if let Ok(count_str) = mon_ch.query(&format!(
@@ -728,28 +745,64 @@ pub fn run_mirror(config: &MirrorConfig) -> Result<()> {
                                 )) {
                                     let ch_count: u64 = count_str.trim().parse().unwrap_or(0);
                                     if ch_count > 0 {
-                                        let elapsed = mon_start.elapsed().as_secs();
-                                        let rows_per_sec = ch_count as f64 / elapsed as f64;
-                                        let remaining = if mon_est > 0 && ch_count < mon_est as u64 {
-                                            let left = mon_est as u64 - ch_count;
-                                            let eta_secs = left as f64 / rows_per_sec;
-                                            if eta_secs >= 3600.0 {
-                                                format!("ETA {:.1}h", eta_secs / 3600.0)
-                                            } else {
-                                                format!("ETA {:.0}m", eta_secs / 60.0)
+                                        let now = Instant::now();
+                                        samples.push_back((now, ch_count));
+                                        while let Some((t, _)) = samples.front() {
+                                            if now.duration_since(*t) > WINDOW { samples.pop_front(); } else { break; }
+                                        }
+
+                                        // Needs two samples far enough apart to mean
+                                        // anything. Until then say so rather than
+                                        // inventing a number.
+                                        let rate = match (samples.front(), samples.back()) {
+                                            (Some((t0, c0)), Some((t1, c1))) => {
+                                                let dt = t1.duration_since(*t0).as_secs_f64();
+                                                if dt >= 30.0 && c1 > c0 {
+                                                    Some((c1 - c0) as f64 / dt)
+                                                } else {
+                                                    None
+                                                }
                                             }
-                                        } else {
-                                            "finishing".to_string()
+                                            _ => None,
+                                        };
+
+                                        let rate_str = match rate {
+                                            Some(r) => format!("{:.0}k rows/s", r / 1000.0),
+                                            None => "rate pending".to_string(),
+                                        };
+
+                                        // mon_est is pg_class.reltuples — a planner
+                                        // ESTIMATE, and a stale one wherever autoanalyze
+                                        // has never run. Measured 6.3% low on
+                                        // ciqestimatenumericdata (5.17G vs an exact
+                                        // 5.52G). So the percentage is approximate, the
+                                        // total is marked `~`, and the value is NOT
+                                        // clamped to 100: a load that passes the
+                                        // estimate should say 106%, not sit at a false
+                                        // 100% for the last 17 minutes of real work.
+                                        let eta = match rate {
+                                            _ if mon_est <= 0 => String::new(),
+                                            Some(r) if (ch_count as i64) < mon_est && r > 0.0 => {
+                                                let left = (mon_est as u64 - ch_count) as f64;
+                                                let secs = left / r;
+                                                if secs >= 3600.0 {
+                                                    format!(", ETA {:.1}h", secs / 3600.0)
+                                                } else {
+                                                    format!(", ETA {:.0}m", secs / 60.0)
+                                                }
+                                            }
+                                            Some(_) => ", past estimate".to_string(),
+                                            None => String::new(),
                                         };
                                         let pct = if mon_est > 0 {
-                                            (ch_count as f64 / mon_est as f64 * 100.0).min(100.0)
+                                            ch_count as f64 / mon_est as f64 * 100.0
                                         } else {
                                             0.0
                                         };
                                         info!(
-                                            "[W{}] {} progress: {:.1}% ({}/{} rows, {:.0} rows/s, {})",
+                                            "[W{}] {} progress: {:.1}% ({}/~{} rows, {}{})",
                                             mon_wid, mon_table, pct, ch_count, mon_est,
-                                            rows_per_sec, remaining
+                                            rate_str, eta
                                         );
                                     }
                                 }
