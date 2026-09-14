@@ -27,12 +27,36 @@ To query with correct deduplication: `SELECT ... FROM table FINAL WHERE _pg2ch_i
 
 CH types are determined by ClickHouse's own `postgresql()` table function via `DESCRIBE TABLE postgresql(...)`. This ensures the mapping is always consistent with what CH would produce natively. Nullable PG columns become `Nullable()` in CH. PK columns are never Nullable.
 
-The **one** post-processing step is timezone pinning: `DESCRIBE` always returns
-a bare `DateTime64(6)`, which silently binds the column to the ClickHouse
-server default. `clickhouse::pin_datetime_timezone` writes the config's
-`timezone:` into whatever DateTime type CH chose. This is not a type mapping —
-CH still decides Int32 vs Decimal vs String — and there is no mapping table to
-maintain. See `timezones.md`.
+There are **two** post-processing steps. Neither is a type mapping — CH still
+decides Int32 vs Decimal vs String vs DateTime64, and there is no mapping table
+to maintain. Both only qualify a type CH already chose, and both must be applied
+in the same two places: `create_ch_table`, and the drift check's normalisation
+of `DESCRIBE` output. Miss the second and the adjusted column reads as drift
+forever, so the next load silently reverts it.
+
+1. **Timezone pinning.** `DESCRIBE` always returns a bare `DateTime64(6)`, which
+   silently binds the column to the ClickHouse server default.
+   `clickhouse::pin_datetime_timezone` writes the config's
+   `store_naive_timestamps_as_timezone` into whatever DateTime type CH chose.
+   See `timezones.md`.
+
+2. **Widening the unconstrained decimal.** A PG `numeric` with no declared
+   precision is arbitrary-precision; CH maps it to `Decimal(38, 19)`, which
+   holds only 19 digits *before* the point. A source value >= 10^19 then fails
+   the INSERT with `Code: 69 ... Decimal value is too big` — and that aborts the
+   whole run, not just the row. `clickhouse::widen_unconstrained_decimal`
+   rewrites exactly `Decimal(38, 19)` to `Decimal(76, 19)` (Decimal256, 57
+   integer digits). That shape is precisely the unconstrained-numeric signature,
+   since a declared `numeric(p,s)` maps to `Decimal(p,s)`, so declared
+   precisions are left alone.
+
+   On 2026-09-14 one row of `cstat.sec_dtrt` (gvkey 108893,
+   `trfd = 17485804441876462000`, in a column whose values are otherwise ~1.0)
+   blocked `cdc_cstat` across eight consecutive scheduled attempts and left its
+   slot 74 GB behind. One implausible row in 2,382,042 stopped a 149-table
+   mirror. Widening does not make overflow impossible, only implausible: beyond
+   57 integer digits it still fails, which is right — truncating a number the
+   source really holds would be worse than stopping.
 
 CDC type conversions handled in `types.rs`:
 - `bool` → `UInt8` (t/f → 1/0)
