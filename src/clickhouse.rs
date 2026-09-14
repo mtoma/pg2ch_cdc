@@ -147,6 +147,30 @@ pub fn pin_datetime_timezone(ch_type: &str, tz: &str) -> String {
     })
 }
 
+/// Drop the timezone from every `DateTime`/`DateTime64` in a type string.
+///
+/// Only for COMPARING two type strings. A timezone difference on an existing
+/// column is not schema drift: the stored instants are what they are, and
+/// `resolve_table_timezone` already treats the column type as the authority.
+/// Recreating a table over it would silently convert the mirror's convention
+/// as a side effect of a type comparison.
+///
+/// That is not theoretical. On 2026-09-14, moving type selection off
+/// `DESCRIBE postgresql()` and onto `typemap` made 70 columns across 39 tables
+/// differ from the configured timezone — `ciq` and `fds` tables still on
+/// Europe/Paris from before the UTC migration. Comparing raw would have
+/// dropped and reloaded all 39 on their next run: 11.89 billion rows, 85.25
+/// GiB, with the slot unable to confirm throughout. The Paris -> UTC migration
+/// is real work, but it is scheduled work, not a side effect.
+pub fn strip_datetime_timezone(ch_type: &str) -> String {
+    rewrite_datetimes(ch_type, &mut |args: &str| {
+        match args.find('\'') {
+            None => None,
+            Some(q) => Some(args[..q].trim_end().trim_end_matches(',').to_string()),
+        }
+    })
+}
+
 /// The timezone declared on the first `DateTime`/`DateTime64` in a type
 /// string, or `None` if the type has no DateTime or leaves it unstated.
 pub fn datetime_timezone(ch_type: &str) -> Option<String> {
@@ -552,4 +576,41 @@ mod tests {
 
 
 
+
+    #[test]
+    fn strips_the_timezone_for_comparison_only() {
+        assert_eq!(strip_datetime_timezone("DateTime64(6, 'UTC')"), "DateTime64(6)");
+        assert_eq!(
+            strip_datetime_timezone("Nullable(DateTime64(6, 'Europe/Paris'))"),
+            "Nullable(DateTime64(6))"
+        );
+        // Same precision, different zone -> identical once stripped.
+        assert_eq!(
+            strip_datetime_timezone("DateTime64(6, 'Europe/Paris')"),
+            strip_datetime_timezone("DateTime64(6, 'UTC')")
+        );
+    }
+
+    #[test]
+    fn stripping_leaves_a_real_type_change_visible() {
+        // A precision change is drift and must survive stripping.
+        assert_ne!(
+            strip_datetime_timezone("DateTime64(6, 'UTC')"),
+            strip_datetime_timezone("DateTime64(3, 'UTC')")
+        );
+        // So is a widened decimal.
+        assert_ne!(
+            strip_datetime_timezone("Nullable(Decimal(38, 19))"),
+            strip_datetime_timezone("Nullable(Decimal(76, 19))")
+        );
+        // And a different type entirely.
+        assert_ne!(strip_datetime_timezone("Int32"), strip_datetime_timezone("Int64"));
+    }
+
+    #[test]
+    fn stripping_is_harmless_on_types_without_a_timezone() {
+        for t in ["String", "Int32", "Nullable(Decimal(10, 2))", "DateTime64(6)", "Date32"] {
+            assert_eq!(strip_datetime_timezone(t), t, "type {t} was modified");
+        }
+    }
 }

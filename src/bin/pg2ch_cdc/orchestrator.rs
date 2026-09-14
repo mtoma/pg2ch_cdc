@@ -18,7 +18,7 @@ use std::time::{Duration, Instant};
 use tracing::{info, warn, error};
 
 use crate::cdc::{CdcConfig, drain_cdc};
-use pg2ch_cdc::clickhouse::{
+use pg2ch_cdc::clickhouse::{strip_datetime_timezone, 
     datetime_timezone, has_datetime, pin_datetime_timezone, ChClient,
 };
 use pg2ch_cdc::config::MirrorConfig;
@@ -436,7 +436,39 @@ pub fn run_mirror(config: &MirrorConfig) -> Result<()> {
         // CREATE makes.
         let pg_schema: Vec<(String, String)> = ch_columns_for(&pg, config, &ti.table, &ti.pk_cols)?;
 
-        if ch_schema != pg_schema {
+        // Compare with the timezone stripped from every DateTime. A timezone
+        // difference on an EXISTING column is not drift: the stored instants
+        // are what they are, `resolve_table_timezone` already treats the
+        // column type as the authority, and converting a mirror's convention
+        // as a side effect of a type comparison is not a decision this check
+        // gets to make. A Paris -> UTC migration is scheduled work — it starts
+        // when someone drops the table.
+        //
+        // Measured when type selection moved to `typemap` on 2026-09-14:
+        // comparing raw would have recreated 39 tables — 11.89 billion rows,
+        // 85.25 GiB — for 70 timezone-only column differences, with the
+        // replication slot unable to confirm for the duration.
+        let tz_blind = |v: &Vec<(String, String)>| -> Vec<(String, String)> {
+            v.iter()
+                .map(|(n, t)| (n.clone(), strip_datetime_timezone(t)))
+                .collect()
+        };
+        let real_drift = tz_blind(&ch_schema) != tz_blind(&pg_schema);
+
+        if !real_drift && ch_schema != pg_schema {
+            let n = ch_schema
+                .iter()
+                .zip(pg_schema.iter())
+                .filter(|((_, a), (_, b))| a != b)
+                .count();
+            info!(
+                "{}: {} column(s) differ only by timezone — left as they are. \
+                 Drop the table to migrate it.",
+                ch_table, n
+            );
+        }
+
+        if real_drift {
             warn!(
                 "Schema drift on {}: dropping and recreating from current PG schema",
                 ch_table
