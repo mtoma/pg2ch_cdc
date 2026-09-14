@@ -18,7 +18,7 @@ use std::time::{Duration, Instant};
 use tracing::{info, warn, error};
 
 use crate::cdc::{CdcConfig, drain_cdc};
-use pg2ch_cdc::clickhouse::{
+use pg2ch_cdc::clickhouse::{widen_unconstrained_decimal, 
     datetime_timezone, has_datetime, pin_datetime_timezone, ChClient,
 };
 use pg2ch_cdc::config::MirrorConfig;
@@ -441,7 +441,8 @@ pub fn run_mirror(config: &MirrorConfig) -> Result<()> {
             .filter_map(|line| {
                 let mut p = line.split('\t');
                 let name = p.next()?.to_string();
-                let ty = pin_datetime_timezone(p.next()?, &config.store_naive_timestamps_as_timezone);
+                let ty = widen_unconstrained_decimal(
+                    &pin_datetime_timezone(p.next()?, &config.store_naive_timestamps_as_timezone));
                 Some((name, ty))
             })
             .collect();
@@ -992,7 +993,8 @@ fn create_ch_table(
             // ClickHouse chose the type; we only make the timezone of any
             // DateTime in it explicit. DESCRIBE always omits it, which would
             // leave the column silently bound to the server default.
-            col_defs.push(format!("    {} {}", parts[0], pin_datetime_timezone(parts[1], tz)));
+            col_defs.push(format!("    {} {}", parts[0],
+                widen_unconstrained_decimal(&pin_datetime_timezone(parts[1], tz))));
         }
     }
     if col_defs.is_empty() {

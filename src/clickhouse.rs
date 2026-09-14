@@ -147,6 +147,54 @@ pub fn pin_datetime_timezone(ch_type: &str, tz: &str) -> String {
     })
 }
 
+/// Widen the decimal that `postgresql()` picks for an UNCONSTRAINED PG `numeric`.
+///
+/// A PostgreSQL `numeric` with no declared precision is arbitrary-precision.
+/// ClickHouse maps it to `Decimal(38, 19)` — 38 digits total with 19 after the
+/// point, so only **19 digits before** it. A source value >= 10^19 therefore
+/// cannot be represented, and the INSERT fails with
+/// `Code: 69 ... Decimal value is too big`, which kills the whole CDC run, not
+/// just that row.
+///
+/// That happened on 2026-09-14: one row of `cstat.sec_dtrt` (gvkey 108893,
+/// `trfd = 17485804441876462000`, 20 digits, against a column whose values are
+/// normally ~1.0) blocked `cdc_cstat` for four hours and left its slot 74 GB
+/// behind, with WAL retention climbing the whole time. One implausible row in
+/// 2.38 million stopped an entire mirror.
+///
+/// `Decimal(38, 19)` is exactly the signature of an unconstrained numeric — a
+/// declared `numeric(p,s)` maps to `Decimal(p,s)` — so rewriting precisely that
+/// shape to `Decimal(76, 19)` (Decimal256: 57 digits before the point) touches
+/// nothing else. It costs 32 bytes per value instead of 16, on the handful of
+/// columns that are genuinely unconstrained.
+///
+/// This does not make overflow impossible, only implausible. A value needing
+/// more than 57 integer digits still fails — loudly, which is correct.
+pub fn widen_unconstrained_decimal(ch_type: &str) -> String {
+    const NEEDLE: &str = "Decimal(";
+    let mut out = String::with_capacity(ch_type.len());
+    let bytes = ch_type.as_bytes();
+    let mut i = 0;
+    while i < ch_type.len() {
+        let at_boundary = i == 0 || !(bytes[i - 1].is_ascii_alphanumeric() || bytes[i - 1] == b'_');
+        if at_boundary && ch_type[i..].starts_with(NEEDLE) {
+            let args_start = i + NEEDLE.len();
+            if let Some(close) = ch_type[args_start..].find(')') {
+                let args = &ch_type[args_start..args_start + close];
+                let compact: String = args.chars().filter(|c| !c.is_whitespace()).collect();
+                if compact == "38,19" {
+                    out.push_str("Decimal(76, 19)");
+                    i = args_start + close + 1;
+                    continue;
+                }
+            }
+        }
+        out.push(ch_type[i..].chars().next().unwrap());
+        i += ch_type[i..].chars().next().unwrap().len_utf8();
+    }
+    out
+}
+
 /// The timezone declared on the first `DateTime`/`DateTime64` in a type
 /// string, or `None` if the type has no DateTime or leaves it unstated.
 pub fn datetime_timezone(ch_type: &str) -> Option<String> {
@@ -547,5 +595,52 @@ mod tests {
         // DST rejection needs ClickHouse's timezone database, so it lives in
         // validate_timezone_in_ch and is covered by tests/test_timezone_dst.sh.
         assert!(validate_timezone("Europe/Paris").is_ok());
+    }
+
+    #[test]
+    fn widens_only_the_unconstrained_numeric_signature() {
+        // The shape postgresql() emits for an unconstrained PG `numeric`.
+        assert_eq!(widen_unconstrained_decimal("Decimal(38, 19)"), "Decimal(76, 19)");
+        assert_eq!(
+            widen_unconstrained_decimal("Nullable(Decimal(38, 19))"),
+            "Nullable(Decimal(76, 19))"
+        );
+        // Spacing from DESCRIBE is not guaranteed.
+        assert_eq!(widen_unconstrained_decimal("Decimal(38,19)"), "Decimal(76, 19)");
+    }
+
+    #[test]
+    fn leaves_declared_precisions_alone() {
+        // numeric(p,s) in PG maps to Decimal(p,s); those are deliberate and
+        // must not be widened, or we would misreport the source's own limits.
+        for t in [
+            "Decimal(10, 2)",
+            "Decimal(38, 18)",
+            "Decimal(38, 20)",
+            "Decimal(76, 19)",
+            "Nullable(Decimal(18, 4))",
+            "String",
+            "Nullable(DateTime64(6, 'UTC'))",
+        ] {
+            assert_eq!(widen_unconstrained_decimal(t), t, "should be untouched: {}", t);
+        }
+    }
+
+    #[test]
+    fn widening_survives_nesting_and_identifier_boundaries() {
+        assert_eq!(
+            widen_unconstrained_decimal("Array(Nullable(Decimal(38, 19)))"),
+            "Array(Nullable(Decimal(76, 19)))"
+        );
+        // A type whose name merely ends in "Decimal" must not match.
+        assert_eq!(widen_unconstrained_decimal("MyDecimal(38, 19)"), "MyDecimal(38, 19)");
+    }
+
+    #[test]
+    fn widening_composes_with_timezone_pinning() {
+        let ty = widen_unconstrained_decimal(&pin_datetime_timezone("Decimal(38, 19)", "UTC"));
+        assert_eq!(ty, "Decimal(76, 19)");
+        let ty = widen_unconstrained_decimal(&pin_datetime_timezone("Nullable(DateTime64(6))", "UTC"));
+        assert_eq!(ty, "Nullable(DateTime64(6, 'UTC'))");
     }
 }
