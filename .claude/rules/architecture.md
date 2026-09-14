@@ -58,6 +58,49 @@ forever, so the next load silently reverts it.
    57 integer digits it still fails, which is right — truncating a number the
    source really holds would be worse than stopping.
 
+### Known limitation: scale 19 rounds a few unconstrained-numeric values
+
+Choosing scale 19 for an unconstrained `numeric` fixes the *precision* problem
+and leaves a much smaller *scale* one. PostgreSQL's unconstrained `numeric`
+carries arbitrary decimal places; the mirror keeps 19, so a source value with
+more is rounded on the way in. Silently: nothing detects it. Not row counts,
+not the DST histograms, not the Snowflake diff, which hashes at lower precision
+anyway.
+
+Measured 2026-09-14. Only three columns in `ciq`, `cstat` and `fds` are
+unconstrained numerics at all — `cstat.sec_mthtrt.trfm`, `cstat.sec_mthtrt.trt1m`
+and `cstat.sec_dtrt.trfd` — and `trfm` and `trfd` both top out at scale 16. So
+one column in the whole mirror is affected:
+
+```text
+cstat.sec_mthtrt.trt1m
+  affected rows        2,414 of 8,282,144 non-null  (0.0291%)
+  max absolute error   0.00000000000000000005       (5e-20)
+  max relative error   0.0000027                    (2.7e-6)
+  affected values      1.1e-14 .. 4.8e-4
+  dates                1962-02-28 .. 2026-08-31     (not only historic rows)
+  scales seen          20:558  21:588  22:137  23:33  24:17  25:3  26:2
+                       28:2    29:744  30:330
+
+  PG   0.000008181819599606399   (21 dp)
+  CH   0.0000081818195996063     (19 dp)
+```
+
+Deliberately not fixed. `Decimal(76, 30)` would hold every digit, but the worst
+error is in the twentieth decimal place of a monthly total-return figure whose
+largest affected value is 0.00048 — no calculation run on these numbers can see
+it. The fix costs another full reload of the table and commits the mapping to
+matching PostgreSQL's arbitrary precision digit for digit, which is the thing
+we chose not to do.
+
+Revisit if a *new* unconstrained numeric column appears whose values are large
+AND finely scaled — the combination this column happens not to have. The
+detection query:
+
+```sql
+SELECT count(*) FILTER (WHERE scale(col) > 19), max(scale(col)) FROM schema.table;
+```
+
 CDC type conversions handled in `types.rs`:
 - `bool` → `UInt8` (t/f → 1/0)
 - `timestamp` / `timestamptz` → forwarded verbatim; ClickHouse resolves them
