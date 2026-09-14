@@ -52,8 +52,8 @@ forever, so the next load silently reverts it.
 
    On 2026-09-14 one row of `cstat.sec_dtrt` (gvkey 108893,
    `trfd = 17485804441876462000`, in a column whose values are otherwise ~1.0)
-   blocked `cdc_cstat` across eight consecutive scheduled attempts and left its
-   slot 74 GB behind. One implausible row in 2,382,042 stopped a 149-table
+   blocked `cdc_cstat` for 3h31m — 13 failed attempts across 7 scheduled runs —
+   and left its slot 74 GB behind. One implausible row in 2,382,042 stopped a 149-table
    mirror. Widening does not make overflow impossible, only implausible: beyond
    57 integer digits it still fails, which is right — truncating a number the
    source really holds would be worse than stopping.

@@ -158,9 +158,10 @@ pub fn pin_datetime_timezone(ch_type: &str, tz: &str) -> String {
 ///
 /// That happened on 2026-09-14: one row of `cstat.sec_dtrt` (gvkey 108893,
 /// `trfd = 17485804441876462000`, 20 digits, against a column whose values are
-/// normally ~1.0) blocked `cdc_cstat` for four hours and left its slot 74 GB
-/// behind, with WAL retention climbing the whole time. One implausible row in
-/// 2.38 million stopped an entire mirror.
+/// normally ~1.0) blocked `cdc_cstat` from 05:57 to 09:28 CEST — 13 failed
+/// attempts across 7 scheduled runs — and left its slot 74 GB behind, with WAL
+/// retention climbing the whole time. One implausible row in 2,382,042 stopped
+/// a 149-table mirror.
 ///
 /// `Decimal(38, 19)` is exactly the signature of an unconstrained numeric — a
 /// declared `numeric(p,s)` maps to `Decimal(p,s)` — so rewriting precisely that
