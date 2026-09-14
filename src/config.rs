@@ -29,6 +29,20 @@ pub struct MirrorConfig {
     /// run warns. Do not set it for a new mirror.
     #[serde(default)]
     pub timezone_allow_dst: bool,
+    /// Per-column ClickHouse type overrides, for the exceptions the mapping
+    /// in `typemap.rs` should not be bent to accommodate.
+    ///
+    /// ```yaml
+    /// column_types:
+    ///   sec_dtrt:
+    ///     trfd: Nullable(Decimal(76, 19))
+    /// ```
+    ///
+    /// The value is written verbatim into the CREATE, into the load's
+    /// PostgreSQL-engine source, and into the drift comparison — all three, or
+    /// the override reads as drift and the next load silently reverts it.
+    #[serde(default)]
+    pub column_types: std::collections::HashMap<String, std::collections::HashMap<String, String>>,
     pub source: SourceConfig,
     pub destination: DestinationConfig,
     #[serde(default)]
@@ -131,6 +145,11 @@ fn default_parallel_loads() -> usize { 4 }
 fn default_ch_timeout() -> u64 { 3600 }
 
 impl MirrorConfig {
+    /// The configured ClickHouse type for `table.column`, if one is declared.
+    pub fn column_type_override(&self, table: &str, column: &str) -> Option<&str> {
+        self.column_types.get(table)?.get(column).map(|s| s.as_str())
+    }
+
     pub fn load(path: &Path) -> Result<Self> {
         let contents = std::fs::read_to_string(path)
             .with_context(|| format!("Failed to read config file: {}", path.display()))?;

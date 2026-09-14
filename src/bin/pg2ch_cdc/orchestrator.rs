@@ -18,11 +18,12 @@ use std::time::{Duration, Instant};
 use tracing::{info, warn, error};
 
 use crate::cdc::{CdcConfig, drain_cdc};
-use pg2ch_cdc::clickhouse::{widen_unconstrained_decimal, 
+use pg2ch_cdc::clickhouse::{
     datetime_timezone, has_datetime, pin_datetime_timezone, ChClient,
 };
 use pg2ch_cdc::config::MirrorConfig;
 use pg2ch_cdc::pg::PgClient;
+use pg2ch_cdc::typemap::{ch_type_for, PgColumn};
 
 pub fn run_mirror(config: &MirrorConfig) -> Result<()> {
     let src = &config.source;
@@ -399,7 +400,7 @@ pub fn run_mirror(config: &MirrorConfig) -> Result<()> {
         let ch_table = config.ch_table_name(&ti.table);
 
         if !ti.ch_table_exists {
-            create_ch_table(&ch, config, &ti.table, &ch_table, &ti.pk_cols)?;
+            create_ch_table(&ch, &pg, config, &ti.table, &ch_table, &ti.pk_cols)?;
             continue;
         }
 
@@ -426,26 +427,14 @@ pub fn run_mirror(config: &MirrorConfig) -> Result<()> {
             })
             .collect();
 
-        let pg_schema_raw = ch.query(&format!(
-            "DESCRIBE TABLE postgresql('{}:{}', '{}', '{}', '{}', '{}', '{}') FORMAT TabSeparated",
-            src.host, src.port, src.database, ti.table, src.user, src.password, src.schema
-        ))?;
-        // Normalise the DESCRIBE side exactly as create_ch_table does before
-        // issuing the CREATE, or the comparison is rigged: DESCRIBE always
-        // returns a BARE DateTime64(p) (no setting changes that), while the
-        // table we built from it carries the configured timezone. Comparing
-        // the two raw reports drift on every pinned table forever, which both
-        // destroys real drift detection and silently reverts the timezone.
-        let pg_schema: Vec<(String, String)> = pg_schema_raw.lines()
-            .filter(|l| !l.is_empty())
-            .filter_map(|line| {
-                let mut p = line.split('\t');
-                let name = p.next()?.to_string();
-                let ty = widen_unconstrained_decimal(
-                    &pin_datetime_timezone(p.next()?, &config.store_naive_timestamps_as_timezone));
-                Some((name, ty))
-            })
-            .collect();
+        // Compare against the types WE would create, not against
+        // DESCRIBE's. Both sides must go through the same mapping, including
+        // any per-column override, or the adjusted column reads as drift
+        // forever and the next load silently reverts it. That has now bitten
+        // this codebase twice — a pinned timezone (9e2d57f) and a widened
+        // decimal — so the comparison is deliberately the same call the
+        // CREATE makes.
+        let pg_schema: Vec<(String, String)> = ch_columns_for(&pg, config, &ti.table, &ti.pk_cols)?;
 
         if ch_schema != pg_schema {
             warn!(
@@ -455,7 +444,7 @@ pub fn run_mirror(config: &MirrorConfig) -> Result<()> {
             warn!("  CH had ({} cols): {:?}", ch_schema.len(), ch_schema);
             warn!("  PG now ({} cols): {:?}", pg_schema.len(), pg_schema);
             ch.query(&format!("DROP TABLE {} SYNC", ch_table))?;
-            create_ch_table(&ch, config, &ti.table, &ch_table, &ti.pk_cols)?;
+            create_ch_table(&ch, &pg, config, &ti.table, &ch_table, &ti.pk_cols)?;
         } else if ti.reload_reason != ReloadReason::None {
             warn!("Truncating {} (reload scheduled)", ch_table);
             ch.query(&format!("TRUNCATE TABLE {}", ch_table))?;
@@ -560,11 +549,15 @@ pub fn run_mirror(config: &MirrorConfig) -> Result<()> {
                     // loaded: the configured value IS this table's value here.
                     let table_tz = dst_timezone.clone();
 
-                    // Get column names
+                    // Name AND type: the type list becomes the structure of the
+                    // PostgreSQL-engine source below, so the reader parses into the
+                    // types we chose rather than the ones it would have guessed.
+                    // TabSeparatedRaw, not TabSeparated — the latter escapes the
+                    // quotes inside DateTime64(6, 'UTC').
                     let col_response = match ch.query(&format!(
-                        "SELECT name FROM system.columns \
+                        "SELECT name, type FROM system.columns \
                          WHERE database = '{}' AND table = '{}' \
-                         AND name NOT LIKE '_pg2ch_%' ORDER BY position FORMAT TabSeparated",
+                         AND name NOT LIKE '_pg2ch_%' ORDER BY position FORMAT TabSeparatedRaw",
                         ch_db, ch_tbl
                     )) {
                         Ok(r) => r,
@@ -574,7 +567,24 @@ pub fn run_mirror(config: &MirrorConfig) -> Result<()> {
                             continue;
                         }
                     };
-                    let columns: Vec<&str> = col_response.lines().filter(|l| !l.is_empty()).collect();
+                    let mut columns: Vec<String> = Vec::new();
+                    let mut proxy_defs: Vec<String> = Vec::new();
+                    for line in col_response.lines().filter(|l| !l.is_empty()) {
+                        let mut it = line.split('\t');
+                        match (it.next(), it.next()) {
+                            (Some(n), Some(t)) => {
+                                columns.push(format!("`{}`", n));
+                                proxy_defs.push(format!("`{}` {}", n, t));
+                            }
+                            _ => {}
+                        }
+                    }
+                    if proxy_defs.is_empty() {
+                        let e = format!("no data columns found for {}", ch_table);
+                        error!("[W{}] {}", worker_id, e);
+                        errors.lock().unwrap().push(format!("{}: {}", table, e));
+                        continue;
+                    }
 
                     // Query OID right before the load to minimize the race window
                     // between OID capture and postgresql() reading the table.
@@ -626,16 +636,45 @@ pub fn run_mirror(config: &MirrorConfig) -> Result<()> {
                     //     with the 1184 columns declared String. Verified to work,
                     //     including under a deliberately mismatched session_timezone.
                     // See .claude/rules/timezones.md, "timestamptz on the load path".
+                    // Read through a PostgreSQL-engine table whose structure we
+                    // declare, rather than the postgresql() table function whose
+                    // types ClickHouse infers. Two reasons, both measured:
+                    //
+                    //   - The function maps an unconstrained PG `numeric` to
+                    //     Decimal(38, 19) and dies on any value >= 10^19, taking the
+                    //     whole run with it. cstat.sec_dtrt.trfd did exactly that on
+                    //     2026-09-14. Declaring the type ourselves reads all
+                    //     2,382,042 rows, oversized value included.
+                    //   - It is faster: 1481 ms against 4760 ms server-side over the
+                    //     same 2.38M rows, because the reader parses into the target
+                    //     type once instead of inferring and re-converting.
+                    //
+                    // The structure is the target table's own data columns, so the
+                    // two can never disagree.
+                    let proxy = format!("{}.`__pg2ch_src_{}`", ch_db, ch_tbl);
+                    let create_proxy = format!(
+                        "CREATE TABLE {} ({}) ENGINE = PostgreSQL('{}:{}', '{}', '{}', '{}', '{}', '{}')",
+                        proxy,
+                        proxy_defs.join(", "),
+                        src_host, src_port, src_database, table, src_user, src_password, src_schema
+                    );
                     let insert = format!(
                         "INSERT INTO {} ({}, _pg2ch_rel_id, _pg2ch_synced_at, _pg2ch_is_deleted, _pg2ch_version) \
-                         SELECT *, {}, now64(), 0, 0 FROM postgresql('{}:{}', '{}', '{}', '{}', '{}', '{}') \
+                         SELECT *, {}, now64(), 0, 0 FROM {} \
                          SETTINGS session_timezone = '{}'",
                         ch_table,
                         columns.join(", "),
                         pg_oid,
-                        src_host, src_port, src_database, table, src_user, src_password, src_schema,
+                        proxy,
                         table_tz
                     );
+                    // A proxy left over from a killed run would make CREATE fail.
+                    let _ = ch.query(&format!("DROP TABLE IF EXISTS {} SYNC", proxy));
+                    if let Err(e) = ch.query(&create_proxy) {
+                        error!("[W{}] Failed to create load source {}: {:#}", worker_id, proxy, e);
+                        errors.lock().unwrap().push(format!("{}: {}", table, e));
+                        continue;
+                    }
 
                     info!("[W{}] Loading {}.{} → {} (~{} rows)...", worker_id, src_schema, table, ch_table, pg_rows_est);
 
@@ -701,6 +740,12 @@ pub fn run_mirror(config: &MirrorConfig) -> Result<()> {
                     if let Some(h) = monitor_handle {
                         let _ = h.join();
                     }
+
+                    // The proxy holds no data — it is a foreign-table definition,
+                    // 0 parts and 0 bytes — but leaving one behind would litter the
+                    // database and block the next load's CREATE. Drop it on both
+                    // paths, before the error return.
+                    let _ = ch.query(&format!("DROP TABLE IF EXISTS {} SYNC", proxy));
 
                     if let Err(e) = result {
                         error!("[W{}] Failed to load {}: {:#}", worker_id, ch_table, e);
@@ -970,36 +1015,65 @@ fn resolve_table_timezone(
 }
 
 /// Create CH table from PG schema using DESCRIBE TABLE postgresql().
+
+/// The ClickHouse columns for a source table: PostgreSQL's own catalog put
+/// through `typemap`, with any configured per-column override winning.
+///
+/// Read from `information_schema.columns` rather than
+/// `DESCRIBE TABLE postgresql(...)` so the types are ours to choose. See the
+/// module docs in `typemap.rs` for why that matters.
+fn ch_columns_for(
+    pg: &PgClient,
+    config: &MirrorConfig,
+    table: &str,
+    pk_cols: &[String],
+) -> Result<Vec<(String, String)>> {
+    let rows = pg.query(&format!(
+        "SELECT column_name, data_type, is_nullable, \
+                coalesce(numeric_precision::text, ''), coalesce(numeric_scale::text, '') \
+         FROM information_schema.columns \
+         WHERE table_schema = '{}' AND table_name = '{}' \
+         ORDER BY ordinal_position",
+        config.source.schema, table
+    ))?;
+    if rows.is_empty() {
+        bail!("no columns found for {}.{}", config.source.schema, table);
+    }
+    let tz = &config.store_naive_timestamps_as_timezone;
+    let mut out = Vec::with_capacity(rows.len());
+    for r in &rows {
+        let name = r[0].clone();
+        let col = PgColumn {
+            name: name.clone(),
+            data_type: r[1].clone(),
+            is_nullable: r[2] == "YES",
+            numeric_precision: r[3].parse().ok(),
+            numeric_scale: r[4].parse().ok(),
+        };
+        let ty = match config.column_type_override(table, &name) {
+            Some(t) => t.to_string(),
+            None => ch_type_for(&col, tz, pk_cols.iter().any(|p| p == &name))
+                .with_context(|| format!("{}.{}", table, name))?,
+        };
+        out.push((name, ty));
+    }
+    Ok(out)
+}
+
 fn create_ch_table(
     ch: &ChClient,
+    pg: &PgClient,
     config: &MirrorConfig,
     table: &str,
     ch_table: &str,
     pk_cols: &[String],
 ) -> Result<()> {
-    let src = &config.source;
-
-    let describe = ch.query(&format!(
-        "DESCRIBE TABLE postgresql('{}:{}', '{}', '{}', '{}', '{}', '{}') FORMAT TabSeparated",
-        src.host, src.port, src.database, table, src.user, src.password, src.schema
-    ))?;
-
     let tz = &config.store_naive_timestamps_as_timezone;
-    let mut col_defs: Vec<String> = Vec::new();
-    for line in describe.lines() {
-        if line.trim().is_empty() { continue; }
-        let parts: Vec<&str> = line.split('\t').collect();
-        if parts.len() >= 2 {
-            // ClickHouse chose the type; we only make the timezone of any
-            // DateTime in it explicit. DESCRIBE always omits it, which would
-            // leave the column silently bound to the server default.
-            col_defs.push(format!("    {} {}", parts[0],
-                widen_unconstrained_decimal(&pin_datetime_timezone(parts[1], tz))));
-        }
-    }
-    if col_defs.is_empty() {
-        bail!("DESCRIBE returned no columns for {}.{}", src.schema, table);
-    }
+    let cols = ch_columns_for(pg, config, table, pk_cols)?;
+    let mut col_defs: Vec<String> = cols
+        .iter()
+        .map(|(n, t)| format!("    `{}` {}", n, t))
+        .collect();
 
     col_defs.push("    _pg2ch_rel_id UInt32 DEFAULT 0".to_string());
     col_defs.push(format!(
