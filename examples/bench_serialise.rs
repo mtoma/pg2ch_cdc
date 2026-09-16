@@ -13,7 +13,7 @@
 use std::time::{Duration, Instant};
 
 use pg2ch_cdc::clickhouse::{CdcBatch, RowKind};
-use pg2ch_cdc::pgoutput::{ColumnInfo, RelationInfo, TupleData};
+use pg2ch_cdc::pgoutput::{decode_pgoutput, ColumnInfo, PgoutputMessage, RelationInfo, TupleData};
 use pg2ch_cdc::types::write_tuple_into;
 
 /// sec_dprc: gvkey, iid, datadate, curcdd, then 14 numeric/smallint columns.
@@ -44,13 +44,11 @@ fn sample_row(i: usize) -> Vec<TupleData> {
         TupleData::Text(format!("{:06}", i % 400_000)),
         TupleData::Text("01".to_string()),
         TupleData::Text("2026-09-16 00:00:00".to_string()),
-        TupleData::Text("USD".to_string()),
+        TupleData::Text("US\\D".to_string()),  // a backslash in a TEXT column, as happens in reality
     ];
     for c in 0..11 {
         if (i + c) % 10 == 0 {
             v.push(TupleData::Null);
-        } else if c == 3 {
-            v.push(TupleData::Text("a\\b".to_string()));
         } else {
             v.push(TupleData::Text(format!("{}.{:08}", i % 1000, (i * 7 + c) % 100_000_000)));
         }
@@ -59,6 +57,34 @@ fn sample_row(i: usize) -> Vec<TupleData> {
     v.push(TupleData::Text("3".to_string()));
     v.push(TupleData::Text(format!("{}", i)));
     v
+}
+
+/// Encode one row as a pgoutput INSERT message, exactly as Postgres frames it:
+/// 'I', u32 rel_id, 'N', u16 n_cols, then per column a type byte and, for text,
+/// u32 length + bytes.
+fn encode_insert(rel_id: u32, values: &[TupleData]) -> Vec<u8> {
+    let mut m = Vec::with_capacity(256);
+    m.push(b'I');
+    m.extend_from_slice(&rel_id.to_be_bytes());
+    m.push(b'N');
+    m.extend_from_slice(&(values.len() as u16).to_be_bytes());
+    for v in values {
+        match v {
+            TupleData::Null => m.push(b'n'),
+            TupleData::Unchanged => m.push(b'u'),
+            TupleData::Text(s) => {
+                m.push(b't');
+                m.extend_from_slice(&(s.len() as u32).to_be_bytes());
+                m.extend_from_slice(s.as_bytes());
+            }
+            TupleData::Binary(b) => {
+                m.push(b'b');
+                m.extend_from_slice(&(b.len() as u32).to_be_bytes());
+                m.extend_from_slice(b);
+            }
+        }
+    }
+    m
 }
 
 fn peak_rss_kb() -> u64 {
@@ -112,11 +138,37 @@ fn main() {
     }
     let elapsed = started.elapsed();
 
+    // ── decode: the other half of the per-row cost ──────────────────────
+    let messages: Vec<Vec<u8>> = rows.iter().map(|r| encode_insert(54146, r)).collect();
+    let wire: u64 = messages.iter().map(|m| m.len() as u64).sum::<u64>()
+        * (total / messages.len().max(1)) as u64;
+    let d_started = Instant::now();
+    let mut decoded = 0usize;
+    let mut fields = 0usize;
+    while decoded < total {
+        for m in &messages {
+            match decode_pgoutput(m) {
+                Some(PgoutputMessage::Insert { values, .. }) => fields += values.len(),
+                _ => panic!("synthetic message failed to decode"),
+            }
+            decoded += 1;
+            if decoded >= total { break; }
+        }
+    }
+    let d_elapsed = d_started.elapsed();
+
     let secs = elapsed.as_secs_f64();
+    let d_secs = d_elapsed.as_secs_f64();
     println!("rows            {}", done);
     println!("elapsed         {:.3}s", secs);
     println!("throughput      {:.0} rows/s", done as f64 / secs);
     println!("payload         {:.1} MiB", bytes as f64 / 1_048_576.0);
     println!("bytes/row       {:.0}", bytes as f64 / done as f64);
+    println!("--- decode (pgoutput -> TupleData) ---");
+    println!("elapsed         {:.3}s", d_secs);
+    println!("throughput      {:.0} rows/s", decoded as f64 / d_secs);
+    println!("wire            {:.1} MiB  ({} fields)", wire as f64 / 1_048_576.0, fields);
+    println!("--- combined ---");
+    println!("decode+serialise {:.0} rows/s", total as f64 / (secs + d_secs));
     println!("peak RSS        {:.1} MiB", peak_rss_kb() as f64 / 1024.0);
 }
