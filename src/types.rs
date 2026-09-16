@@ -27,7 +27,7 @@ pub fn default_for_oid(oid: u32) -> &'static str {
     }
 }
 
-pub fn build_delete_row(key_values: &[TupleData], rel: &RelationInfo) -> Vec<String> {
+pub fn build_delete_row(key_values: &[TupleData], rel: &RelationInfo) -> Vec<Option<String>> {
     let key_cols: Vec<usize> = rel
         .columns
         .iter()
@@ -43,9 +43,9 @@ pub fn build_delete_row(key_values: &[TupleData], rel: &RelationInfo) -> Vec<Str
             let val = match &key_values[col_idx] {
                 // Text values pass through untouched — including timestamptz,
                 // whose `+01`-style offset ClickHouse resolves itself.
-                TupleData::Text(s) => s.clone(),
-                TupleData::Binary(data) => decode_binary_value(oid, data),
-                TupleData::Null | TupleData::Unchanged => "\\N".to_string(),
+                TupleData::Text(s) => Some(s.clone()),
+                TupleData::Binary(data) => Some(decode_binary_value(oid, data)),
+                TupleData::Null | TupleData::Unchanged => None,
             };
             key_map.insert(col_idx, val);
         }
@@ -55,10 +55,13 @@ pub fn build_delete_row(key_values: &[TupleData], rel: &RelationInfo) -> Vec<Str
         .iter()
         .enumerate()
         .map(|(i, col)| {
+            // Non-key columns get a type-appropriate default rather than
+            // NULL: the column may be NOT NULL in ClickHouse, and only the PK
+            // and _pg2ch_is_deleted matter for a delete.
             key_map
                 .get(&i)
                 .cloned()
-                .unwrap_or_else(|| default_for_oid(col.type_oid).to_string())
+                .unwrap_or_else(|| Some(default_for_oid(col.type_oid).to_string()))
         })
         .collect()
 }
@@ -305,22 +308,30 @@ fn decode_pg_numeric(data: &[u8]) -> String {
 }
 
 /// Convert tuple values to strings, using relation column types for proper conversion.
-pub fn tuple_to_strings(values: &[TupleData], rel: &RelationInfo) -> Vec<String> {
+pub fn tuple_to_strings(values: &[TupleData], rel: &RelationInfo) -> Vec<Option<String>> {
     values
         .iter()
         .enumerate()
         .map(|(i, v)| {
             let oid = rel.columns.get(i).map(|c| c.type_oid).unwrap_or(0);
             match v {
-                TupleData::Text(s) => match oid {
+                TupleData::Text(s) => Some(match oid {
                     // bool — PG sends "t"/"f", ClickHouse UInt8 needs "1"/"0"
                     16 => if s == "t" { "1".to_string() } else { "0".to_string() },
                     // Everything else, timestamps included, goes through
                     // verbatim — see "Timestamp handling" above.
                     _ => s.clone(),
-                },
-                TupleData::Binary(data) => decode_binary_value(oid, data),
-                TupleData::Null | TupleData::Unchanged => "\\N".to_string(),
+                }),
+                TupleData::Binary(data) => Some(decode_binary_value(oid, data)),
+                // NULL is carried OUT OF BAND, as None.
+                //
+                // It used to be the string "\\N" — TabSeparated's NULL marker —
+                // which made a genuine value of those two characters
+                // indistinguishable from NULL, and the serialiser passed it
+                // through unescaped so ClickHouse read it as NULL. A real
+                // `\N` in a text column became NULL, silently. See
+                // tests/test_tsv_escaping.sh.
+                TupleData::Null | TupleData::Unchanged => None,
             }
         })
         .collect()

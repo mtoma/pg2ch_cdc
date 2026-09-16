@@ -96,8 +96,13 @@ impl ChClient {
             "INSERT INTO {} ({}) FORMAT TabSeparated",
             table, columns
         );
+        // No `input_format_tsv_empty_as_default`. With it, an empty field is
+        // replaced by the column default — which for a Nullable column is
+        // NULL — so a genuine empty string arriving through CDC was silently
+        // stored as NULL. We always write every column explicitly, so an empty
+        // field means an empty value, never "use the default".
         let url = format!(
-            "{}/?query={}&input_format_tsv_empty_as_default=1&{}",
+            "{}/?query={}&{}",
             self.base_url,
             urlencoding_encode(&query),
             self.settings
@@ -306,7 +311,7 @@ fn urlencoding_encode(s: &str) -> String {
 pub struct CdcBatch {
     ch_table: String,
     columns: Vec<String>,
-    rows: Vec<Vec<String>>,
+    rows: Vec<Vec<Option<String>>>,
     last_flush: Instant,
     version_counter: u64,
     rel_id: u32,
@@ -362,33 +367,33 @@ impl CdcBatch {
     // offset away from the truth, and would put the audit column on a
     // different convention from the data columns beside it.
 
-    pub fn add_insert(&mut self, values: Vec<String>) {
+    pub fn add_insert(&mut self, values: Vec<Option<String>>) {
         self.version_counter += 1;
         self.total_inserts += 1;
         let mut row = values;
-        row.push(self.rel_id.to_string());
-        row.push("0".into());
-        row.push(self.version_counter.to_string());
+        row.push(Some(self.rel_id.to_string()));
+        row.push(Some("0".into()));
+        row.push(Some(self.version_counter.to_string()));
         self.rows.push(row);
     }
 
-    pub fn add_update(&mut self, values: Vec<String>) {
+    pub fn add_update(&mut self, values: Vec<Option<String>>) {
         self.version_counter += 1;
         self.total_updates += 1;
         let mut row = values;
-        row.push(self.rel_id.to_string());
-        row.push("0".into());
-        row.push(self.version_counter.to_string());
+        row.push(Some(self.rel_id.to_string()));
+        row.push(Some("0".into()));
+        row.push(Some(self.version_counter.to_string()));
         self.rows.push(row);
     }
 
-    pub fn add_delete(&mut self, values: Vec<String>) {
+    pub fn add_delete(&mut self, values: Vec<Option<String>>) {
         self.version_counter += 1;
         self.total_deletes += 1;
         let mut row = values;
-        row.push(self.rel_id.to_string());
-        row.push("1".into());
-        row.push(self.version_counter.to_string());
+        row.push(Some(self.rel_id.to_string()));
+        row.push(Some("1".into()));
+        row.push(Some(self.version_counter.to_string()));
         self.rows.push(row);
     }
 
@@ -436,7 +441,12 @@ impl CdcBatch {
                 if i > 0 {
                     tsv.push('\t');
                 }
-                tsv_escape_into(&mut tsv, val);
+                match val {
+                    // The NULL marker, written only where the value really is
+                    // NULL. Never inferred from the text.
+                    None => tsv.push_str("\\N"),
+                    Some(v) => tsv_escape_into(&mut tsv, v),
+                }
             }
             tsv.push('\n');
         }
@@ -466,12 +476,17 @@ impl CdcBatch {
     }
 }
 
+/// Escape a value that is KNOWN not to be NULL.
+///
+/// Unconditional: a backslash always becomes `\\`, so a genuine value of the
+/// two characters `\N` is written `\\N` and read back as those two
+/// characters. NULL never reaches here — it is written directly by the
+/// serialiser, which knows from `None` rather than guessing from the text.
+///
+/// This used to short-circuit on `val == "\\N"` and emit it unescaped, on the
+/// reasoning that it was our own NULL marker. It could not tell that from a
+/// real value, so a text column containing `\N` silently became NULL.
 fn tsv_escape_into(buf: &mut String, val: &str) {
-    // \N is ClickHouse's TabSeparated NULL marker — must not be escaped
-    if val == "\\N" {
-        buf.push_str("\\N");
-        return;
-    }
     for ch in val.chars() {
         match ch {
             '\t' => buf.push_str("\\t"),
@@ -632,5 +647,69 @@ mod tests {
         for t in ["String", "Int32", "Nullable(Decimal(10, 2))", "DateTime64(6)", "Date32"] {
             assert_eq!(strip_datetime_timezone(t), t, "type {t} was modified");
         }
+    }
+
+    fn batch(cols: &[&str]) -> CdcBatch {
+        let mut b = CdcBatch::new(
+            "db.t".to_string(),
+            cols.iter().map(|s| s.to_string()).collect(),
+            1000,
+            Duration::from_secs(60),
+        );
+        b.set_rel_id(42);
+        b.set_version_counter(100);
+        b
+    }
+
+    #[test]
+    fn a_real_backslash_n_is_escaped_and_null_is_not() {
+        // The bug this replaced: both were emitted as a bare \N, so a text
+        // column containing the two characters \N silently became NULL.
+        // Found by tests/test_tsv_escaping.sh on 2026-09-16.
+        let mut b = batch(&["v"]);
+        b.add_insert(vec![Some("\\N".to_string())]);   // a real value
+        b.add_insert(vec![None]);                     // an actual NULL
+        assert_eq!(b.tsv_payload(), "\\\\N\t42\t0\t101\n\\N\t42\t0\t102\n");
+    }
+
+    #[test]
+    fn separators_inside_a_value_cannot_break_the_row() {
+        let mut b = batch(&["v"]);
+        b.add_insert(vec![Some("a\tb\nc\\d".to_string())]);
+        // One row, one line: the tab and newline are escaped, not emitted raw.
+        let out = b.tsv_payload();
+        assert_eq!(out, "a\\tb\\nc\\\\d\t42\t0\t101\n");
+        assert_eq!(out.matches('\n').count(), 1, "value broke the row: {out:?}");
+        assert_eq!(out.split('\t').count(), 4, "value broke the fields: {out:?}");
+    }
+
+    #[test]
+    fn an_empty_string_stays_an_empty_field() {
+        // Paired with dropping input_format_tsv_empty_as_default: the empty
+        // field must reach ClickHouse as an empty string, not the default.
+        let mut b = batch(&["v"]);
+        b.add_insert(vec![Some(String::new())]);
+        assert_eq!(b.tsv_payload(), "\t42\t0\t101\n");
+    }
+
+    #[test]
+    fn a_delete_marks_the_row_and_keeps_the_key() {
+        let mut b = batch(&["k", "v"]);
+        b.add_delete(vec![Some("key1".to_string()), Some(String::new())]);
+        // is_deleted = 1, key preserved.
+        assert_eq!(b.tsv_payload(), "key1\t\t42\t1\t101\n");
+    }
+
+    #[test]
+    fn utf8_passes_through_untouched() {
+        let mut b = batch(&["v"]);
+        b.add_insert(vec![Some("héllo — 日本語 🚀".to_string())]);
+        assert_eq!(b.tsv_payload(), "héllo — 日本語 🚀\t42\t0\t101\n");
+    }
+
+    #[test]
+    fn column_list_appends_the_meta_columns_in_order() {
+        let b = batch(&["a", "b"]);
+        assert_eq!(b.column_list(), "a, b, _pg2ch_rel_id, _pg2ch_is_deleted, _pg2ch_version");
     }
 }
