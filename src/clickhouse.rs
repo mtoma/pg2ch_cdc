@@ -345,6 +345,13 @@ impl CdcBatch {
         }
     }
 
+    /// Fix the version counter so serialisation can be asserted byte for
+    /// byte. Production seeds it from the wall clock.
+    #[cfg(test)]
+    pub(crate) fn set_version_counter(&mut self, v: u64) {
+        self.version_counter = v;
+    }
+
     pub fn set_rel_id(&mut self, id: u32) {
         self.rel_id = id;
     }
@@ -405,21 +412,24 @@ impl CdcBatch {
         self.rows.clear();
     }
 
-    pub fn flush(&mut self, ch: &ChClient) -> Result<()> {
-        if self.rows.is_empty() {
-            return Ok(());
-        }
-
-        let all_columns: Vec<&str> = self
-            .columns
+    /// The column list this batch inserts into, data columns then meta.
+    pub(crate) fn column_list(&self) -> String {
+        self.columns
             .iter()
             .map(|s| s.as_str())
             .chain(["_pg2ch_rel_id", "_pg2ch_is_deleted", "_pg2ch_version"])
-            .collect();
+            .collect::<Vec<&str>>()
+            .join(", ")
+    }
 
-        let col_list = all_columns.join(", ");
-
-        // Build TSV payload
+    /// Exactly the bytes that would be POSTed to ClickHouse.
+    ///
+    /// Split out of `flush` so the serialisation — escaping, column order,
+    /// the meta columns, the delete marker — can be asserted byte for byte
+    /// without a ClickHouse server. This is the CDC hot path: every row that
+    /// reaches the mirror is built here, so it is worth being able to pin its
+    /// output in a unit test.
+    pub(crate) fn tsv_payload(&self) -> String {
         let mut tsv = String::with_capacity(self.rows.len() * 256);
         for row in &self.rows {
             for (i, val) in row.iter().enumerate() {
@@ -430,6 +440,16 @@ impl CdcBatch {
             }
             tsv.push('\n');
         }
+        tsv
+    }
+
+    pub fn flush(&mut self, ch: &ChClient) -> Result<()> {
+        if self.rows.is_empty() {
+            return Ok(());
+        }
+
+        let col_list = self.column_list();
+        let tsv = self.tsv_payload();
 
         ch.insert_tsv(&self.ch_table, &col_list, &tsv)?;
 
