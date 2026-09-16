@@ -7,6 +7,7 @@
 use std::collections::HashMap;
 use tracing::warn;
 
+use crate::clickhouse::tsv_escape_into;
 use crate::pgoutput::{RelationInfo, TupleData};
 
 // ── Default values for delete rows ──────────────────────────────────────
@@ -308,6 +309,54 @@ fn decode_pg_numeric(data: &[u8]) -> String {
 }
 
 /// Convert tuple values to strings, using relation column types for proper conversion.
+
+/// Write one tuple's data columns into `buf`, tab-separated and escaped, with
+/// no trailing tab or newline. `CdcBatch::add_row` appends the meta columns.
+///
+/// This is the allocation-free counterpart to `tuple_to_strings`: it writes
+/// each field directly rather than building a `Vec<String>` that is copied
+/// again at flush. NULL is written as the TabSeparated marker here, where we
+/// know the value really is NULL, rather than being inferred from the text.
+pub fn write_tuple_into(buf: &mut String, values: &[TupleData], rel: &RelationInfo) {
+    for (i, v) in values.iter().enumerate() {
+        if i > 0 {
+            buf.push('\t');
+        }
+        let oid = rel.columns.get(i).map(|c| c.type_oid).unwrap_or(0);
+        match v {
+            TupleData::Text(s) => match oid {
+                // bool — PG sends "t"/"f", ClickHouse UInt8 needs "1"/"0"
+                16 => buf.push_str(if s == "t" { "1" } else { "0" }),
+                _ => tsv_escape_into(buf, s),
+            },
+            TupleData::Binary(data) => tsv_escape_into(buf, &decode_binary_value(oid, data)),
+            TupleData::Null | TupleData::Unchanged => buf.push_str("\\N"),
+        }
+    }
+}
+
+/// Write a DELETE row: key columns from the message, everything else a
+/// type-appropriate default (the column may be NOT NULL in ClickHouse, and
+/// only the key and `_pg2ch_is_deleted` matter for a delete).
+pub fn write_delete_row_into(buf: &mut String, key_values: &[TupleData], rel: &RelationInfo) {
+    for (i, col) in rel.columns.iter().enumerate() {
+        if i > 0 {
+            buf.push('\t');
+        }
+        let is_key = col.flags & 1 != 0;
+        match key_values.get(i) {
+            Some(v) if is_key => match v {
+                TupleData::Text(s) => tsv_escape_into(buf, s),
+                TupleData::Binary(data) => {
+                    tsv_escape_into(buf, &decode_binary_value(col.type_oid, data))
+                }
+                TupleData::Null | TupleData::Unchanged => buf.push_str("\\N"),
+            },
+            _ => tsv_escape_into(buf, default_for_oid(col.type_oid)),
+        }
+    }
+}
+
 pub fn tuple_to_strings(values: &[TupleData], rel: &RelationInfo) -> Vec<Option<String>> {
     values
         .iter()

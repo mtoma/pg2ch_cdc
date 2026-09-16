@@ -125,6 +125,14 @@ impl ChClient {
     }
 }
 
+/// Which kind of row is being appended — sets `_pg2ch_is_deleted` and the counter.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum RowKind {
+    Insert,
+    Update,
+    Delete,
+}
+
 // ── ClickHouse type-string timezone pinning ─────────────────────────────
 //
 // These post-process a type string ClickHouse itself produced (via DESCRIBE
@@ -311,7 +319,14 @@ fn urlencoding_encode(s: &str) -> String {
 pub struct CdcBatch {
     ch_table: String,
     columns: Vec<String>,
-    rows: Vec<Vec<Option<String>>>,
+    /// Rows are serialised into this buffer as they arrive, not retained as
+    /// `Vec<Vec<Option<String>>>` and converted at flush. That cost one String
+    /// allocation per field per row — ~1.74M per 96k-row batch of an 18-column
+    /// table — plus a second copy of every byte into the payload, and left the
+    /// process at 6.2 GB RSS from allocator churn. `clear()` keeps the
+    /// capacity, so after the first batch there is no reallocation either.
+    tsv: String,
+    row_count: usize,
     last_flush: Instant,
     version_counter: u64,
     rel_id: u32,
@@ -337,7 +352,8 @@ impl CdcBatch {
         Self {
             ch_table,
             columns,
-            rows: Vec::new(),
+            tsv: String::new(),
+            row_count: 0,
             last_flush: Instant::now(),
             version_counter: now_ns,
             rel_id: 0,
@@ -367,43 +383,40 @@ impl CdcBatch {
     // offset away from the truth, and would put the audit column on a
     // different convention from the data columns beside it.
 
-    pub fn add_insert(&mut self, values: Vec<Option<String>>) {
+    /// Append one row, letting the caller write its data fields straight into
+    /// the batch buffer.
+    ///
+    /// The closure receives the buffer positioned at the start of the row and
+    /// must write the data columns tab-separated, escaped, with no trailing
+    /// tab or newline — `types::write_tuple_into` and
+    /// `types::write_delete_row_into` do exactly that. The meta columns and
+    /// the row terminator are appended here, so they can never be forgotten.
+    pub fn add_row<F: FnOnce(&mut String)>(&mut self, kind: RowKind, write_fields: F) {
+        use std::fmt::Write;
         self.version_counter += 1;
-        self.total_inserts += 1;
-        let mut row = values;
-        row.push(Some(self.rel_id.to_string()));
-        row.push(Some("0".into()));
-        row.push(Some(self.version_counter.to_string()));
-        self.rows.push(row);
-    }
-
-    pub fn add_update(&mut self, values: Vec<Option<String>>) {
-        self.version_counter += 1;
-        self.total_updates += 1;
-        let mut row = values;
-        row.push(Some(self.rel_id.to_string()));
-        row.push(Some("0".into()));
-        row.push(Some(self.version_counter.to_string()));
-        self.rows.push(row);
-    }
-
-    pub fn add_delete(&mut self, values: Vec<Option<String>>) {
-        self.version_counter += 1;
-        self.total_deletes += 1;
-        let mut row = values;
-        row.push(Some(self.rel_id.to_string()));
-        row.push(Some("1".into()));
-        row.push(Some(self.version_counter.to_string()));
-        self.rows.push(row);
+        match kind {
+            RowKind::Insert => self.total_inserts += 1,
+            RowKind::Update => self.total_updates += 1,
+            RowKind::Delete => self.total_deletes += 1,
+        }
+        write_fields(&mut self.tsv);
+        let _ = write!(
+            self.tsv,
+            "\t{}\t{}\t{}\n",
+            self.rel_id,
+            if matches!(kind, RowKind::Delete) { 1 } else { 0 },
+            self.version_counter
+        );
+        self.row_count += 1;
     }
 
     pub fn should_flush(&self) -> bool {
-        self.rows.len() >= self.batch_size
-            || (!self.rows.is_empty() && self.last_flush.elapsed() > self.flush_interval)
+        self.row_count >= self.batch_size
+            || (self.row_count > 0 && self.last_flush.elapsed() > self.flush_interval)
     }
 
     pub fn pending_count(&self) -> usize {
-        self.rows.len()
+        self.row_count
     }
 
     pub fn ch_table_name(&self) -> &str {
@@ -414,11 +427,12 @@ impl CdcBatch {
     /// arrives for this table — buffered rows from before the truncate are
     /// about to be wiped server-side anyway.
     pub fn discard_pending(&mut self) {
-        self.rows.clear();
+        self.tsv.clear();
+        self.row_count = 0;
     }
 
     /// The column list this batch inserts into, data columns then meta.
-    pub(crate) fn column_list(&self) -> String {
+    pub fn column_list(&self) -> String {
         self.columns
             .iter()
             .map(|s| s.as_str())
@@ -434,43 +448,29 @@ impl CdcBatch {
     /// without a ClickHouse server. This is the CDC hot path: every row that
     /// reaches the mirror is built here, so it is worth being able to pin its
     /// output in a unit test.
-    pub(crate) fn tsv_payload(&self) -> String {
-        let mut tsv = String::with_capacity(self.rows.len() * 256);
-        for row in &self.rows {
-            for (i, val) in row.iter().enumerate() {
-                if i > 0 {
-                    tsv.push('\t');
-                }
-                match val {
-                    // The NULL marker, written only where the value really is
-                    // NULL. Never inferred from the text.
-                    None => tsv.push_str("\\N"),
-                    Some(v) => tsv_escape_into(&mut tsv, v),
-                }
-            }
-            tsv.push('\n');
-        }
-        tsv
+    /// The exact bytes that would be POSTed — now simply the buffer.
+    pub fn tsv_payload(&self) -> &str {
+        &self.tsv
     }
 
     pub fn flush(&mut self, ch: &ChClient) -> Result<()> {
-        if self.rows.is_empty() {
+        if self.row_count == 0 {
             return Ok(());
         }
 
         let col_list = self.column_list();
-        let tsv = self.tsv_payload();
+        ch.insert_tsv(&self.ch_table, &col_list, &self.tsv)?;
 
-        ch.insert_tsv(&self.ch_table, &col_list, &tsv)?;
-
-        let count = self.rows.len();
+        let count = self.row_count;
         self.total_applied += count as u64;
         tracing::debug!(
             "Flushed {} to {} (total: {} — {}I/{}U/{}D)",
             count, self.ch_table, self.total_applied,
             self.total_inserts, self.total_updates, self.total_deletes
         );
-        self.rows.clear();
+        // clear() keeps the allocation: the next batch reuses it.
+        self.tsv.clear();
+        self.row_count = 0;
         self.last_flush = Instant::now();
         Ok(())
     }
@@ -486,7 +486,7 @@ impl CdcBatch {
 /// This used to short-circuit on `val == "\\N"` and emit it unescaped, on the
 /// reasoning that it was our own NULL marker. It could not tell that from a
 /// real value, so a text column containing `\N` silently became NULL.
-fn tsv_escape_into(buf: &mut String, val: &str) {
+pub(crate) fn tsv_escape_into(buf: &mut String, val: &str) {
     for ch in val.chars() {
         match ch {
             '\t' => buf.push_str("\\t"),
@@ -667,15 +667,15 @@ mod tests {
         // column containing the two characters \N silently became NULL.
         // Found by tests/test_tsv_escaping.sh on 2026-09-16.
         let mut b = batch(&["v"]);
-        b.add_insert(vec![Some("\\N".to_string())]);   // a real value
-        b.add_insert(vec![None]);                     // an actual NULL
+        b.add_row(RowKind::Insert, |buf| tsv_escape_into(buf, "\\N")); // a real value
+        b.add_row(RowKind::Insert, |buf| buf.push_str("\\N"));         // an actual NULL
         assert_eq!(b.tsv_payload(), "\\\\N\t42\t0\t101\n\\N\t42\t0\t102\n");
     }
 
     #[test]
     fn separators_inside_a_value_cannot_break_the_row() {
         let mut b = batch(&["v"]);
-        b.add_insert(vec![Some("a\tb\nc\\d".to_string())]);
+        b.add_row(RowKind::Insert, |buf| tsv_escape_into(buf, "a\tb\nc\\d"));
         // One row, one line: the tab and newline are escaped, not emitted raw.
         let out = b.tsv_payload();
         assert_eq!(out, "a\\tb\\nc\\\\d\t42\t0\t101\n");
@@ -688,14 +688,18 @@ mod tests {
         // Paired with dropping input_format_tsv_empty_as_default: the empty
         // field must reach ClickHouse as an empty string, not the default.
         let mut b = batch(&["v"]);
-        b.add_insert(vec![Some(String::new())]);
+        b.add_row(RowKind::Insert, |buf| tsv_escape_into(buf, ""));
         assert_eq!(b.tsv_payload(), "\t42\t0\t101\n");
     }
 
     #[test]
     fn a_delete_marks_the_row_and_keeps_the_key() {
         let mut b = batch(&["k", "v"]);
-        b.add_delete(vec![Some("key1".to_string()), Some(String::new())]);
+        b.add_row(RowKind::Delete, |buf| {
+            tsv_escape_into(buf, "key1");
+            buf.push('\t');
+            tsv_escape_into(buf, "");
+        });
         // is_deleted = 1, key preserved.
         assert_eq!(b.tsv_payload(), "key1\t\t42\t1\t101\n");
     }
@@ -703,7 +707,7 @@ mod tests {
     #[test]
     fn utf8_passes_through_untouched() {
         let mut b = batch(&["v"]);
-        b.add_insert(vec![Some("héllo — 日本語 🚀".to_string())]);
+        b.add_row(RowKind::Insert, |buf| tsv_escape_into(buf, "héllo — 日本語 🚀"));
         assert_eq!(b.tsv_payload(), "héllo — 日本語 🚀\t42\t0\t101\n");
     }
 

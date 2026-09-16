@@ -80,7 +80,8 @@ use tracing::{debug, error, info, warn};
 use pg2ch_cdc::clickhouse::{CdcBatch, ChClient};
 use pg2ch_cdc::pg::PgClient;
 use pg2ch_cdc::pgoutput::{decode_pgoutput, PgoutputMessage, RelationInfo};
-use pg2ch_cdc::types::{build_delete_row, tuple_to_strings};
+use pg2ch_cdc::clickhouse::RowKind;
+use pg2ch_cdc::types::{write_delete_row_into, write_tuple_into};
 
 // ── Standby status feedback ─────────────────────────────────────────────
 
@@ -267,8 +268,7 @@ fn process_message(
                 format!("INSERT: no table mapping for relation id {}", rel_id)
             })?;
             if let Some(batch) = batches.get_mut(table_name) {
-                let row = tuple_to_strings(&values, rel);
-                batch.add_insert(row);
+                batch.add_row(RowKind::Insert, |buf| write_tuple_into(buf, &values, rel));
                 debug!("INSERT into {}: {} values", table_name, values.len());
             } else {
                 *skipped_counts.entry(table_name.clone()).or_insert(0) += 1;
@@ -292,12 +292,10 @@ fn process_message(
                 // We must delete the old PK before inserting the new row, otherwise the
                 // old PK identity becomes a phantom row in ReplacingMergeTree.
                 if let Some(ref old_vals) = old_values {
-                    let old_row = build_delete_row(old_vals, rel);
-                    batch.add_delete(old_row);
+                    batch.add_row(RowKind::Delete, |buf| write_delete_row_into(buf, old_vals, rel));
                     debug!("UPDATE {}: PK changed — deleting old key", table_name);
                 }
-                let row = tuple_to_strings(&new_values, rel);
-                batch.add_update(row);
+                batch.add_row(RowKind::Update, |buf| write_tuple_into(buf, &new_values, rel));
                 debug!("UPDATE {}: {} values", table_name, new_values.len());
             } else {
                 *skipped_counts.entry(table_name.clone()).or_insert(0) += 1;
@@ -319,12 +317,15 @@ fn process_message(
                 format!("DELETE: no table mapping for relation id {}", rel_id)
             })?;
             if let Some(batch) = batches.get_mut(table_name) {
-                let row = if key_or_old == b'K' {
-                    build_delete_row(&values, rel)
-                } else {
-                    tuple_to_strings(&values, rel)
-                };
-                batch.add_delete(row);
+                // 'K' = key-only (default replica identity): fill non-key
+                // columns with defaults. 'O' = full old tuple: write it as-is.
+                batch.add_row(RowKind::Delete, |buf| {
+                    if key_or_old == b'K' {
+                        write_delete_row_into(buf, &values, rel)
+                    } else {
+                        write_tuple_into(buf, &values, rel)
+                    }
+                });
                 debug!("DELETE from {}", table_name);
             } else {
                 *skipped_counts.entry(table_name.clone()).or_insert(0) += 1;
